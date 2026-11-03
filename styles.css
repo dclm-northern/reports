@@ -134,6 +134,11 @@ legend { font-weight: 600; font-size: .95rem; padding: 0; margin-bottom: .6rem; 
 .total-line { display: flex; justify-content: space-between; align-items: baseline; padding: .65rem .8rem; border-radius: var(--radius-sm);
   background: var(--brand-soft); color: var(--brand); font-weight: 600; margin-top: .5rem; }
 .total-line b { font-size: 1.3rem; }
+.outbox-pill { flex: none; padding: .3rem .7rem; border-radius: 999px; font-size: .82rem; font-weight: 600; white-space: nowrap;
+  background: var(--brand-soft); color: var(--brand); text-decoration: none; border: 1px solid transparent; }
+.outbox-pill.off { background: var(--warn-soft); color: var(--warn); }
+.outbox-pill.bad { background: var(--bad-soft); color: var(--bad); }
+.outbox-pill.hidden { display: none; }
 .fs-sub { font-size: .9rem; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin: .9rem 0 .4rem; }
 .fs-sub:first-of-type { margin-top: .2rem; }
 .choice { display: flex; gap: .5rem; flex-wrap: wrap; }

@@ -57,18 +57,19 @@ var Z = (function () {
         headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ token: state.token, action: action, payload: payload || {} }), signal: ctl ? ctl.signal : undefined })
         .then(function (res) {
           if (timer) clearTimeout(timer);
-          if (!res.ok) throw { message: UNREACHABLE, detail: 'HTTP ' + res.status };
+          if (!res.ok) throw { message: UNREACHABLE, detail: 'HTTP ' + res.status, offline: true };
           return res.text();
         }, function (err) {
           if (timer) clearTimeout(timer);
-          throw { message: err && err.name === 'AbortError' ? 'The server took too long to answer. Try again.' : UNREACHABLE, detail: String(err && err.message || err) };
+          if (err && err.offline) throw err;
+          throw { message: err && err.name === 'AbortError' ? 'The server took too long to answer. Try again.' : UNREACHABLE, detail: String(err && err.message || err), offline: true };
         });
     }
     return new Promise(function (resolve, reject) {
       if (!window.google || !google.script || !google.script.run) { reject({ message: 'Open this page from the web app address.' }); return; }
       google.script.run
         .withSuccessHandler(resolve)
-        .withFailureHandler(function (err) { reject({ message: UNREACHABLE, detail: String(err && err.message || err) }); })
+        .withFailureHandler(function (err) { reject({ message: UNREACHABLE, detail: String(err && err.message || err), offline: true }); })
         .api(state.token, action, payload || {});
     });
   }
@@ -77,15 +78,132 @@ var Z = (function () {
     return send(action, payload).then(function (raw) {
       var r;
       try { r = JSON.parse(raw); } catch (e) { throw { message: 'The server sent an answer that could not be read.' }; }
-      if (r.ok) return r.data;
+      networkIs(true);
+      if (r.ok) { if (KEEP[action] && !(action === 'me' && r.data && r.data.role === 'system')) keep(action, payload, raw); return r.data; }
       if (r.code === 'SESSION' && action !== 'login') signedOut(r.message);
       throw r;
+    }, function (err) {
+      if (err && err.offline) {
+        networkIs(false);
+        var hit = KEEP[action] ? kept(action, payload) : null;
+        if (hit) { try { var r = JSON.parse(hit); if (r.ok) return r.data; } catch (e) {} }
+      }
+      throw err;
     });
+  }
+
+  // ------------------------------------------------------------------ working without network
+  // What the report forms need is kept on the device, so they can be filled in with no network:
+  // the account, the lists of units and meetings. Reports saved with no network wait on the
+  // device (at most LIMIT of them) and are sent, each with a one-time reference, when it returns.
+  var KEEP = { 'boot': 1, 'logo': 1, 'me': 1, 'entry.setup': 1, 'fs.setup': 1, 'org.children': 1 };
+  var LIMIT = 200, OUTBOX = 'zas-outbox';
+  function ls(k, v) {
+    try { if (v === undefined) return localStorage.getItem(k); if (v === null) localStorage.removeItem(k); else localStorage.setItem(k, v); return true; } catch (e) { return v === undefined ? null : false; }
+  }
+  function keepKey(action, payload) {
+    if (action === 'me') return 'zas-k:me';
+    var who = action === 'boot' || action === 'logo' ? 'all' : state.me ? state.me.id : '';
+    return 'zas-k:' + who + ':' + action + ':' + JSON.stringify(payload || {});
+  }
+  function keep(action, payload, raw) { if (raw.length < 150000) ls(keepKey(action, payload), raw); }
+  function kept(action, payload) { return ls(keepKey(action, payload)); }
+  function forgetKept() {
+    try { Object.keys(localStorage).forEach(function (k) { if (k.indexOf('zas-k:') === 0) localStorage.removeItem(k); }); } catch (e) {}
+  }
+  function rememberMe(me) { if (me && me.role !== 'system') ls('zas-k:me', JSON.stringify({ ok: true, data: me })); }
+  /** The account last used on this device, for entering reports with no network. */
+  function offlineProfile() { var raw = kept('me'); try { var r = raw && JSON.parse(raw); return r && r.ok ? r.data : null; } catch (e) { return null; } }
+
+  function networkIs(up) {
+    if (state.offline === !up) return;
+    state.offline = !up;
+    badge();
+    if (up) setTimeout(flush, 500);
+  }
+
+  function boxAll() { try { var l = JSON.parse(ls(OUTBOX) || '[]'); return Array.isArray(l) ? l : []; } catch (e) { return []; } }
+  function boxSave(list) { return ls(OUTBOX, JSON.stringify(list)); }
+  function boxMine() { var id = state.me && state.me.id; return boxAll().filter(function (x) { return x.uid === id; }); }
+  function boxChange(ref, patch) {
+    var list = boxAll();
+    list.forEach(function (x, i) { if (x.ref === ref) list[i] = patch === null ? null : Object.assign(x, patch); });
+    boxSave(list.filter(Boolean));
+    badge();
+  }
+  function newRef() {
+    var a = new Uint8Array(12);
+    (window.crypto || window.msCrypto).getRandomValues(a);
+    return Array.prototype.map.call(a, function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
+  }
+  /** Keep a report on this device until there is network. Throws a plain message when it cannot. */
+  function queue(action, payload, label) {
+    var list = boxAll();
+    if (list.length >= LIMIT) throw { message: 'This device is already keeping ' + LIMIT + ' reports waiting for the network, which is the most it keeps. They are sent as soon as there is network; then you can enter more.' };
+    var p = {};
+    Object.keys(payload).forEach(function (k) { if (k !== 'confirmed' && k !== 'client_ref') p[k] = payload[k]; });
+    var item = { ref: payload.client_ref || newRef(), uid: state.me.id, user: state.me.full_name, action: action, payload: p, label: label || {}, at: new Date().toISOString(), status: 'waiting', review: !state.token };
+    list.push(item);
+    if (!boxSave(list)) throw { message: 'This report could not be kept on the device: its storage is full or switched off (for example in a private window). It has not been saved. Write the figures down and enter them when there is network.' };
+    badge();
+    return item;
+  }
+
+  var flushing = false;
+  /** Send the reports waiting on this device, one by one, while there is network and a session. */
+  function flush() {
+    if (flushing || !state.token || !state.me) return Promise.resolve(0);
+    var mine = boxMine().filter(function (x) { return x.status === 'waiting' && !x.review; });
+    if (!mine.length) return Promise.resolve(0);
+    flushing = true;
+    var sent = 0;
+    var next = function (i) {
+      if (i >= mine.length) return null;
+      var x = mine[i];
+      return call(x.action, Object.assign({}, x.payload, { client_ref: x.ref }, x.confirmed ? { confirmed: '1' } : {})).then(function () {
+        boxChange(x.ref, null); sent++;
+        return next(i + 1);
+      }, function (err) {
+        if (err && (err.offline || err.code === 'SESSION')) return null;   // try again later
+        boxChange(x.ref, { status: 'problem', message: err && err.message || 'It could not be saved.', code: err && err.code || '', notes: err && err.fields && err.fields._notes || null, fields: err && err.fields || null });
+        return next(i + 1);
+      });
+    };
+    return Promise.resolve(next(0)).then(function () {
+      flushing = false;
+      badge();
+      if (sent) {
+        state.cache = {};
+        toast(sent + ' waiting report' + (sent === 1 ? ' was' : 's were') + ' sent.');
+        if (state.route && state.route.path === '/outbox' && !unsaved().length) route();
+      }
+      var problems = boxMine().filter(function (x) { return x.status === 'problem'; }).length;
+      if (problems && !sent) toast(problems + ' waiting report' + (problems === 1 ? ' needs' : 's need') + ' your attention.');
+      return sent;
+    }, function () { flushing = false; return 0; });
+  }
+  window.addEventListener('online', function () { setTimeout(flush, 1500); });
+  setInterval(function () { if (navigator.onLine !== false) flush(); }, 60 * 1000);
+
+  /** The marker in the top bar: no network, reports waiting, reports needing attention. */
+  function badge() {
+    var pill = $('#outboxPill');
+    if (!pill) return;
+    var mine = state.me ? boxMine() : [];
+    var waiting = mine.filter(function (x) { return x.status === 'waiting'; }).length;
+    var problems = mine.length - waiting;
+    var parts = [];
+    if (state.offline || state.offlineOnly) parts.push('No network');
+    if (waiting) parts.push(waiting + ' waiting');
+    if (problems) parts.push(problems + ' to check');
+    pill.textContent = parts.join(' · ');
+    pill.className = 'outbox-pill' + (problems ? ' bad' : state.offline || state.offlineOnly ? ' off' : '') + (parts.length ? '' : ' hidden');
+    pill.setAttribute('aria-label', parts.length ? parts.join(', ') + '. Open the reports waiting to be sent.' : '');
   }
 
   function signedOut(message) {
     closeDrawer();
-    state.token = null; state.me = null; state.cache = {};
+    state.token = null; state.me = null; state.cache = {}; state.offlineOnly = false;
     try { sessionStorage.removeItem('zas-token'); } catch (e) {}
     App.login(message);
   }
@@ -191,7 +309,8 @@ var Z = (function () {
   // The pages visited, so Close can return to the one before.
   var visited = [];
   function route() {
-    if (!state.token || !state.me) return;
+    if (!state.me || (!state.token && !state.offlineOnly)) return;
+    if (state.token) setTimeout(flush, 0);
     var here = location.hash || '#/';
     if (visited[visited.length - 1] !== here) visited.push(here);
     if (visited.length > 50) visited.shift();
@@ -215,6 +334,12 @@ var Z = (function () {
 
   function showError(el, e) {
     if (e && e.code === 'SESSION') return;
+    if (e && e.offline) {
+      var enter = state.me && state.me.arm ? '#/fs/entry/new' : '#/entry/attendance/new';
+      el.innerHTML = '<h1>No network</h1><div class="notice warn" role="status">This page needs the network, and this device cannot reach the server just now.</div>'
+        + (state.me && state.me.role !== 'system' ? '<p>You can still enter reports. They wait on this device and are sent by themselves as soon as the network returns.</p><div class="btn-row"><a class="btn primary" href="' + enter + '">Enter a report</a><a class="btn" href="#/outbox">Reports waiting to be sent</a></div>' : '<p>Try again when the device is connected.</p>');
+      return;
+    }
     el.innerHTML = '<h1>' + esc(e && e.code === 'FORBIDDEN' ? 'No access' : 'This page could not be shown') + '</h1><div class="notice bad" role="alert">' + esc(e && e.message ? e.message : 'Something went wrong.') + '</div>'
       + '<p><a href="#/">Back to the dashboard</a></p>';
   }
@@ -276,12 +401,14 @@ var Z = (function () {
         '<header class="top"><button type="button" class="icon-btn menu-btn" data-open-menu aria-label="Open the menu">' + icon('menu') + '</button>'
         + '<a class="brand" href="#/"><span class="logo">' + logoHtml() + '</span><span class="brand-text"><b>' + esc(me.settings.app_name)
         + '</b><span>' + esc(me.settings.church) + '</span></span></a>'
+        + '<a class="outbox-pill hidden" id="outboxPill" href="#/outbox" aria-live="polite"></a>'
         + '<button type="button" class="icon-btn" data-theme-toggle></button></header>'
         + '<div class="layout"><aside class="side" id="side"></aside><main class="main" id="main" tabindex="-1"></main></div>'
         + '<nav class="bottom" aria-label="Shortcuts" id="bottom"></nav>';
       $$('[data-theme-toggle]').forEach(labelThemeButton);
     }
     $('#side').innerHTML = menuHtml(me, r.path);
+    badge();
     var p = r.path;
     var tabs = me.arm ? [['/', 'Home', 'home', p === '/'], ['/fs/entry/new', 'Enter', 'edit', p.indexOf('/fs') === 0], ['/reports/' + me.arm, 'Reports', 'chart', p.indexOf('/reports') === 0]]
       : [['/', 'Home', 'home', p === '/'], me.role === 'system' ? ['/admin/maintenance', 'System', 'edit', p.indexOf('/admin') === 0 || p.indexOf('/users') === 0] : ['/entry/attendance', 'Enter', 'edit', p.indexOf('/entry') === 0],
@@ -347,7 +474,15 @@ var Z = (function () {
     if (t.hasAttribute('data-theme-toggle')) toggleTheme();
     else if (t.hasAttribute('data-open-menu')) openDrawer();
     else if (t.hasAttribute('data-close-menu')) closeDrawer();
-    else if (t.hasAttribute('data-signout')) { call('logout').catch(function () {}).then(function () { signedOut('You have signed out.'); }); }
+    else if (t.hasAttribute('data-signout')) {
+      var waiting = boxMine().length;
+      (waiting ? ask({ title: 'Sign out?', message: waiting + ' report' + (waiting === 1 ? ' is' : 's are') + ' waiting on this device to be sent. ' + (waiting === 1 ? 'It stays' : 'They stay') + ' here and ' + (waiting === 1 ? 'is' : 'are') + ' sent the next time you sign in on this device with network.', ok: 'Sign out', tone: 'warn' }) : Promise.resolve(true))
+        .then(function (yes) {
+          if (!yes) return;
+          forgetKept();
+          (state.token ? call('logout').catch(function () {}) : Promise.resolve()).then(function () { signedOut('You have signed out.'); });
+        });
+    }
     else if (t.hasAttribute('data-print')) window.print();
     else if (t.hasAttribute('data-csv') && state.lastTable) csv(state.lastTable);
   });
@@ -609,13 +744,26 @@ var Z = (function () {
       }
       form.askedOk = false;
       var payload = formData(form);
+      // A new report gets its one-time reference before the first try, so that if the reply is
+      // lost on a weak signal and the report is sent again later, it is recognised, not saved twice.
+      if (form.dataset.offline) payload.client_ref = newRef();
       if (extra) Object.keys(typeof extra === 'function' ? extra() : extra).forEach(function (k) { payload[k] = (typeof extra === 'function' ? extra() : extra)[k]; });
       btn.setAttribute('aria-busy', 'true');
       var label = btn.textContent;
       btn.textContent = 'Saving…';
       showFieldErrors(form, null);
+      if (state.offlineOnly && form.dataset.offline) {
+        // Working with no network and no session: keep it at once (it is checked when sent).
+        try { var held = queue(action, payload, form.offlineLabel ? form.offlineLabel(payload) : null); }
+        catch (err) { showFieldErrors(form, err); btn.removeAttribute('aria-busy'); btn.textContent = label; return; }
+        form.dirty = false; done({ queued: held }, payload); btn.removeAttribute('aria-busy'); btn.textContent = label;
+        return;
+      }
       var send = function () {
         return call(action, payload).catch(function (err) {
+          if (err && err.offline && form.dataset.offline && state.me) {
+            return { queued: queue(action, payload, form.offlineLabel ? form.offlineLabel(payload) : null) };
+          }
           // Figures worth a second look: ask once, then save again with the answer.
           if (err && err.code === 'CONFIRM') {
             var notes = err.fields && err.fields._notes;
@@ -635,6 +783,7 @@ var Z = (function () {
         done(data, payload);
       }).catch(function (err) {
         showFieldErrors(form, err);
+        if (err && err.offline) { try { form.dispatchEvent(new Event('zas-offline')); } catch (e) {} }
       }).then(function () { btn.removeAttribute('aria-busy'); btn.textContent = label; });
     });
     // Remember unsaved typing, so leaving the page can ask first.
@@ -748,6 +897,7 @@ var Z = (function () {
   return {
     date: date, when: when, closeBtn: closeBtn, lc: function (l) { l = String(l || ''); return /^[A-Z][a-z]/.test(l) ? l.charAt(0).toLowerCase() + l.slice(1) : l; },
     state: state, esc: esc, num: num, money: money, pct: pct, $: $, $$: $$, href: href, go: go, call: call, toast: toast, ask: ask, route: route,
+    outbox: { mine: boxMine, change: boxChange, flush: flush, queue: queue, limit: LIMIT }, offlineProfile: offlineProfile, rememberMe: rememberMe, badge: badge,
     icon: icon, reportHtml: reportHtml, sectionHtml: sectionHtml, picker: picker, bindForm: bindForm, field: field, text: text, showFieldErrors: showFieldErrors,
     chart: chart, labelThemeButton: labelThemeButton, parseHash: parseHash, signedOut: signedOut, formData: formData, LABEL: LABEL
   };

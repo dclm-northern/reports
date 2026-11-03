@@ -27,6 +27,9 @@ var App = (function () {
     else Z.call('picture').then(function (p) { Z.state.picture = p; paint(p); }).catch(function () {});
   }
 
+  /** Where to open with no network: the report form for this person's role. */
+  function startForm(me) { return me.arm ? '#/fs/entry/new' : '#/entry/attendance/new'; }
+
   function start() {
     Promise.all([Z.call('boot'), Z.call('logo').catch(function () { return null; })]).then(function (res) {
       var b = res[0];
@@ -38,7 +41,11 @@ var App = (function () {
       if (!b.initialised) return guest('<div class="notice warn">The system has not been set up yet. The owner of the script must run <b>initialise</b> in the Apps Script editor first.</div>');
       if (b.needsSetup) return setupView();
       if (!Z.state.token) return login();
-      return Z.call('me').then(function (me) { Z.state.me = me; Z.route(); }).catch(function () { login(); });
+      return Z.call('me').then(function (me) {
+        Z.state.me = me;
+        if (Z.state.offline && (!location.hash || location.hash === '#' || location.hash === '#/')) location.hash = startForm(me);
+        Z.route();
+      }).catch(function () { login(); });
     }).catch(function (e) {
       guest('<div class="notice bad" role="alert">' + esc(e.message || 'The system could not be reached.') + '</div>');
     });
@@ -60,9 +67,26 @@ var App = (function () {
       + (BOOT.setupPending ? '<p class="small" style="margin:.6rem 0 0;text-align:center"><a href="#" id="toSetup">Create the System Admin with the set-up code</a></p>' : ''));
     var ts = $('#toSetup'); if (ts) ts.addEventListener('click', function (e) { e.preventDefault(); setupView(); });
     var f = $('#login');
+    var prof = Z.offlineProfile();
+    var offerOffline = function () {
+      if (!prof || prof.role === 'system' || $('#offlineGo')) return;
+      var p = document.createElement('div');
+      p.className = 'notice warn'; p.setAttribute('role', 'status'); p.style.marginTop = '1rem';
+      p.innerHTML = '<b>No network?</b> You can still enter reports on this device as <b>' + esc(prof.full_name) + '</b>. They are sent when the network returns and you sign in.'
+        + '<div style="margin-top:.6rem"><button type="button" class="btn" id="offlineGo">Enter reports without network</button></div>';
+      f.parentNode.insertBefore(p, f.nextSibling);
+      $('#offlineGo').addEventListener('click', function () {
+        Z.state.me = prof; Z.state.token = null; Z.state.offlineOnly = true;
+        location.hash = startForm(prof); Z.route();
+      });
+    };
+    if (navigator.onLine === false || Z.state.offline) offerOffline();
+    f.addEventListener('zas-offline', offerOffline);
     $('#f_username').focus();
     Z.bindForm(f, 'login', null, function (d) {
-      Z.state.token = d.token; Z.state.me = d.me;
+      Z.state.token = d.token; Z.state.me = d.me; Z.state.offlineOnly = false;
+      Z.rememberMe(d.me);
+      if (Z.outbox.mine().some(function (x) { return x.review; })) { try { sessionStorage.setItem('zas-token', d.token); } catch (e) {} location.hash = '#/outbox'; Z.route(); return; }
       try { sessionStorage.setItem('zas-token', d.token); } catch (e) {}
       if (!location.hash || location.hash === '#') location.hash = '#/'; else Z.route();
     });
@@ -417,8 +441,13 @@ var App = (function () {
       wireSum(form);
       wireWeek(form);
       wirePeriod(form, s);
+      if (!editing) {
+        form.dataset.offline = '1';
+        form.offlineLabel = function (pl) { return reportLabel(form, KIND[kind].one, pl); };
+      }
       Z.bindForm(form, editing ? 'entry.update' : 'entry.create', editing ? { kind: kind, id: rep.id, version: rep.version, p: rep.p } : { kind: kind }, function (d) {
         if (editing) { Z.toast('Correction saved.'); Z.go('/entry/' + kind + '/' + rep.id, { p: d && d.p ? d.p : rep.p }); return; }
+        if (d && d.queued) { heldOnDevice(form); return; }
         Z.toast('Report saved.');
         // Keep the location and meeting; clear the figures for the next one.
         $$('[data-field] input[inputmode]', form).forEach(function (i) { i.value = ''; });
@@ -430,6 +459,70 @@ var App = (function () {
       });
       form.addEventListener('click', function (e) { if (e.target.matches && e.target.matches('[data-open-existing]')) { e.preventDefault(); } });
     });
+  }
+
+  /** What the waiting list shows for a report kept on the device. */
+  function reportLabel(form, what, pl) {
+    var picked = function (sel) { var o = sel && sel.options[sel.selectedIndex]; return o && o.value ? o.textContent : ''; };
+    var unit = '';
+    $$('#where select, #f_institution_id', form).forEach(function (s) { var t = picked(s); if (t) unit = t; });
+    if (!unit && $('#where p', form)) unit = $('#where p', form).textContent.trim();   // a unit that was not chosen: the person's own
+    var meeting = picked($('#f_type_id', form)).split(',')[0] || picked($('#f_gck_day', form));
+    var total = $('[data-sum-total]', form);
+    return { what: what.charAt(0).toUpperCase() + what.slice(1), unit: unit, meeting: meeting, date: pl.report_date || pl.month || '', total: total ? total.textContent : '' };
+  }
+  /** A report that will be sent later: clear the figures, as after saving, and say what happens next. */
+  function heldOnDevice(form) {
+    Z.toast('No network: kept on this device.');
+    $$('[data-field] input[inputmode]', form).forEach(function (i) { i.value = ''; });
+    $$('input[type=radio]', form).forEach(function (i) { i.checked = false; });
+    wireSum(form);
+    var n = Z.outbox.mine().length;
+    var box = $('[data-form-error]', form);
+    box.innerHTML = '<div class="notice warn" role="status"><b>No network, so this report is kept on this device.</b> It will be sent by itself as soon as the network returns'
+      + (Z.state.offlineOnly ? ' and you sign in' : '') + '. ' + n + ' report' + (n === 1 ? ' is' : 's are') + ' waiting. <a href="#/outbox">See them</a>, or enter the next one below.</div>';
+    box.scrollIntoView({ block: 'center' });
+  }
+
+  // ------------------------------------------------------------------ reports waiting on this device
+  function outbox(main) {
+    var mine = Z.outbox.mine().slice().sort(function (a, b) { return a.at.localeCompare(b.at); });
+    var waiting = mine.filter(function (x) { return x.status === 'waiting' && !x.review; });
+    var review = mine.filter(function (x) { return x.review; });
+    var problems = mine.filter(function (x) { return x.status === 'problem' && !x.review; });
+    var off = Z.state.offline || Z.state.offlineOnly;
+    var line = function (x) {
+      var l = x.label || {};
+      return '<li><span class="grow"><b>' + esc(l.unit || l.what || 'Report') + '</b><span class="small muted">' + esc([l.what, l.meeting, !l.date ? '' : l.date.length === 7 ? monthLabel(l.date) : Z.date(l.date)].filter(Boolean).join(', '))
+        + '. Entered ' + esc(Z.when(x.at.replace('T', ' ').substring(0, 19))) + '</span>'
+        + (x.status === 'problem' ? '<span class="small" style="color:var(--bad)">' + esc(x.message) + (x.notes && x.notes.length ? ' ' + esc(x.notes.join(' ')) : '') + '</span>' : '') + '</span>'
+        + (l.total ? '<b class="nowrap">' + esc(l.total) + '</b>' : '')
+        + '<span class="btn-row">' + (x.status === 'problem' && x.code === 'CONFIRM' ? '<button type="button" class="btn small primary" data-ob-anyway="' + esc(x.ref) + '">Send anyway</button>' : '')
+        + '<button type="button" class="btn small danger" data-ob-remove="' + esc(x.ref) + '">Remove</button></span></li>';
+    };
+    var h = '<div class="page-head"><div><h1>Reports waiting to be sent</h1><p class="small muted">Reports entered on this device with no network. They are sent by themselves when the network returns. This device keeps at most ' + Z.outbox.limit + '.</p></div>'
+      + Z.closeBtn('#/') + '</div>';
+    if (off) h += '<div class="notice warn" role="status">No network just now. ' + (Z.state.offlineOnly ? 'When it returns, sign in to send these reports.' : 'They will be sent when it returns.') + '</div>';
+    if (Z.state.offlineOnly) h += '<div class="btn-row" style="margin-bottom:1rem"><button type="button" class="btn primary" data-ob-signin>Sign in to send</button></div>';
+    if (!mine.length) h += '<div class="card empty">No reports are waiting on this device.</div>';
+    if (review.length && !Z.state.offlineOnly) h += '<div class="card pad" style="margin-bottom:1rem"><h2>Entered while signed out</h2><p class="small muted">These were entered on this device with no network before you signed in. Check that they are yours and correct, then send them.</p><ul class="list" style="margin:0 -1rem">' + review.map(line).join('') + '</ul><div class="btn-row" style="margin-top:.75rem"><button type="button" class="btn primary" data-ob-accept>Send these ' + review.length + '</button></div></div>';
+    else if (review.length) h += '<div class="card"><ul class="list">' + review.map(line).join('') + '</ul></div>';
+    if (problems.length) h += '<h2 style="margin-top:1rem">Need your attention</h2><p class="small muted">The server did not accept these. Read the reason. If a figure is unusual but correct, press Send anyway. Otherwise remove the report and enter it again correctly.</p><div class="card"><ul class="list">' + problems.map(line).join('') + '</ul></div>';
+    if (waiting.length) h += '<div class="page-head" style="margin-top:1rem"><h2>Waiting (' + waiting.length + ')</h2>' + (!off ? '<button type="button" class="btn small" data-ob-send>Send now</button>' : '') + '</div><div class="card"><ul class="list">' + waiting.map(line).join('') + '</ul></div>';
+    main.innerHTML = h;
+    main.onclick = function (e) {
+      var b = e.target.closest ? e.target.closest('button') : null;
+      if (!b) return;
+      if (b.hasAttribute('data-ob-send')) { b.setAttribute('aria-busy', 'true'); b.textContent = 'Sending…'; Z.outbox.flush().then(function () { Z.route(); }); }
+      if (b.hasAttribute('data-ob-signin')) { App.login('Sign in to send the reports waiting on this device.'); }
+      if (b.hasAttribute('data-ob-accept')) { review.forEach(function (x) { Z.outbox.change(x.ref, { review: false }); }); Z.outbox.flush().then(function () { Z.route(); }); }
+      if (b.hasAttribute('data-ob-anyway')) { Z.outbox.change(b.getAttribute('data-ob-anyway'), { status: 'waiting', confirmed: true, message: '', notes: null }); Z.outbox.flush().then(function () { Z.route(); }); }
+      if (b.hasAttribute('data-ob-remove')) {
+        var ref = b.getAttribute('data-ob-remove');
+        Z.ask({ title: 'Remove this report?', message: 'It has not been sent. Removing it deletes it from this device, and it will not reach the system.', ok: 'Remove report', tone: 'danger' })
+          .then(function (yes) { if (yes) { Z.outbox.change(ref, null); Z.toast('Removed from this device.'); Z.route(); } });
+      }
+    };
   }
 
   function yesNo(name, label, rep) {
@@ -688,8 +781,13 @@ var App = (function () {
       main.innerHTML = h;
       var form = $('#fsf');
       wireSum(form); wireWeek(form);
+      if (!editing) {
+        form.dataset.offline = '1';
+        form.offlineLabel = function (pl) { return reportLabel(form, A.code + ' report', pl); };
+      }
       Z.bindForm(form, editing ? 'fs.update' : 'fs.create', editing ? { id: x.id, p: x.p, version: x.version } : null, function (d) {
         if (editing) { Z.toast('Correction saved.'); Z.go('/fs/entry/' + d.id, { p: d.p }); return; }
+        if (d && d.queued) { heldOnDevice(form); return; }
         Z.toast('Report saved.');
         $$('[data-field] input[inputmode]', form).forEach(function (i) { i.value = ''; });
         wireSum(form);
@@ -1269,7 +1367,7 @@ var App = (function () {
       }
       if (!p.length) return dashboard;
       return { entry: entry, reports: report, org: org, search: search, users: users, account: account, admin: admin, heads: heads, groups: groups,
-        schools: institutions, campuses: institutions, fs: fsEntry, zone: zoneLeader }[p[0]]
+        schools: institutions, campuses: institutions, fs: fsEntry, zone: zoneLeader, outbox: outbox }[p[0]]
         || function (main) { main.innerHTML = '<h1>Page not found</h1><div class="card empty">That page does not exist. <a href="#/">Go to the dashboard</a>.</div>'; };
     }
   };
