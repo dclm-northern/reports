@@ -10,6 +10,14 @@
   var reset = m ? (/^[a-f0-9]{64}$/.test(m[1]) ? m[1] : 'invalid') : '';
   window.BOOT = { reset: reset, appName: '', church: '', url: location.pathname, web: '' };
 
+  // The fonts load without holding up the page: on a weak signal it shows at once in the
+  // device's own fonts, and switches when (if) they arrive.
+  var fonts = document.createElement('link');
+  fonts.rel = 'stylesheet'; fonts.media = 'print';
+  fonts.href = 'https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap';
+  fonts.onload = function () { fonts.media = 'all'; };
+  document.head.appendChild(fonts);
+
   window.ZAS_ERRORS = [];
   window.addEventListener('error', function (e) {
     if (e && e.message) ZAS_ERRORS.push(e.message + (e.lineno ? ' (line ' + e.lineno + ')' : ''));

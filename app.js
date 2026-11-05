@@ -48,10 +48,16 @@ var Z = (function () {
   // Two ways to reach the same server: on GitHub Pages (window.ZAS_API is the script's /exec
   // address) a plain web request; on the script's own address, Google's built-in channel.
   var UNREACHABLE = 'The server could not be reached. Check the internet connection and try again.';
+  // How long to wait for the server before treating the signal as gone. A new report is safe to
+  // keep on the device after WAIT_SAVE (its one-time reference stops a second copy if the first
+  // did arrive); signing in gives up after WAIT_LOGIN; reports and other pages wait longer.
+  var WAIT_SAVE = 20000, WAIT_LOGIN = 25000, WAIT_OTHER = 90000, WAIT_KEPT = 6000;
+  var SAVES = { 'entry.create': 1, 'fs.create': 1 };
   function send(action, payload) {
     if (window.ZAS_API) {
       var ctl = window.AbortController ? new AbortController() : null;
-      var timer = ctl ? setTimeout(function () { ctl.abort(); }, 90000) : null;
+      var limit = SAVES[action] ? WAIT_SAVE : action === 'login' ? WAIT_LOGIN : WAIT_OTHER;
+      var timer = ctl ? setTimeout(function () { ctl.abort(); }, limit) : null;
       // text/plain keeps this a "simple" request, which Apps Script can answer across sites.
       return fetch(window.ZAS_API, { method: 'POST', redirect: 'follow', credentials: 'omit', cache: 'no-store',
         headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ token: state.token, action: action, payload: payload || {} }), signal: ctl ? ctl.signal : undefined })
@@ -62,7 +68,7 @@ var Z = (function () {
         }, function (err) {
           if (timer) clearTimeout(timer);
           if (err && err.offline) throw err;
-          throw { message: err && err.name === 'AbortError' ? 'The server took too long to answer. Try again.' : UNREACHABLE, detail: String(err && err.message || err), offline: true };
+          throw { message: err && err.name === 'AbortError' ? 'The network is too weak to reach the server just now. Try again.' : UNREACHABLE, detail: String(err && err.message || err), offline: true };
         });
     }
     return new Promise(function (resolve, reject) {
@@ -75,6 +81,21 @@ var Z = (function () {
   }
 
   function call(action, payload) {
+    var req = ask_(action, payload);
+    // What the forms need and is kept on the device: on a weak signal, use the kept copy after a
+    // few seconds instead of waiting, and let the fresh answer update the copy when it arrives.
+    var copy = KEEP[action] ? kept(action, payload) : null;
+    if (!copy) return req;
+    return new Promise(function (resolve, reject) {
+      var settled = false;
+      var timer = setTimeout(function () {
+        try { var r = JSON.parse(copy); if (r.ok) { settled = true; networkIs(false); resolve(r.data); } } catch (e) {}
+      }, WAIT_KEPT);
+      req.then(function (d) { clearTimeout(timer); if (!settled) { settled = true; resolve(d); } },
+        function (e) { clearTimeout(timer); if (!settled) { settled = true; reject(e); } });
+    });
+  }
+  function ask_(action, payload) {
     return send(action, payload).then(function (raw) {
       var r;
       try { r = JSON.parse(raw); } catch (e) { throw { message: 'The server sent an answer that could not be read.' }; }
