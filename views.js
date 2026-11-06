@@ -118,14 +118,20 @@ var App = (function () {
     } catch (e) {}
     Z.call('link.check', { token: token }).then(function (u) {
       if (!u) { badLink('This link has expired or has already been used. Ask your administrator for a new one.'); return; }
-      guest('<h2 style="margin-bottom:.4rem">Set your password</h2><p class="small muted">Account: <b>' + esc(u.username) + '</b> (' + esc(u.full_name) + ')</p>'
+      guest((u.choose
+          ? '<h2 style="margin-bottom:.4rem">Set up your account</h2><p class="small muted">Welcome, <b>' + esc(u.full_name) + '</b>' + (u.role_label ? ' (' + esc(u.role_label) + ')' : '') + '. Choose the username and password you will sign in with.</p>'
+          : '<h2 style="margin-bottom:.4rem">Set your password</h2><p class="small muted">Account: <b>' + esc(u.username) + '</b> (' + esc(u.full_name) + ')</p>')
         + '<form id="reset" novalidate><div data-form-error></div>'
+        + (u.choose ? Z.field('username', 'Choose a username', '<input type="text" id="f_username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="40" data-required="Choose a username.">',
+            '3 to 40 letters, numbers, dots, dashes or underscores, for example kwame.mensah. You will type it every time you sign in, and it cannot be changed later.') : '')
         + Z.field('password', 'New password', '<div class="pw"><input type="password" id="f_password" name="password" autocomplete="new-password"><button type="button" class="pw-toggle" data-pw-toggle aria-label="Show the password" aria-pressed="false">Show</button></div>', 'At least 10 characters, not containing your username.')
         + Z.field('confirm', 'Type it again', '<div class="pw"><input type="password" id="f_confirm" name="confirm" autocomplete="new-password"><button type="button" class="pw-toggle" data-pw-toggle aria-label="Show the password" aria-pressed="false">Show</button></div>')
-        + '<button type="submit" class="btn primary" style="width:100%">Save password</button></form>');
-      Z.bindForm($('#reset'), 'link.use', { token: token }, function () {
+        + '<button type="submit" class="btn primary" style="width:100%">' + (u.choose ? 'Create my account' : 'Save password') + '</button></form>');
+      if (u.choose) $('#f_username').focus();
+      Z.bindForm($('#reset'), 'link.use', { token: token }, function (d) {
         BOOT.reset = '';
-        login('Your password is set. Sign in with it now.');
+        login(u.choose ? 'Your account is ready. Your username is ' + d.username + '. Sign in with it now.' : 'Your password is set. Sign in with it now.');
+        if (d && d.username && $('#f_username')) { $('#f_username').value = d.username; $('#f_password').focus(); }
       });
     }).catch(function (e) { badLink(e.message); });
   }
@@ -1049,7 +1055,7 @@ var App = (function () {
         + '<div><label for="u_s">Showing</label><select id="u_s" name="status"><option value="">Active</option><option value="inactive"' + (q.status === 'inactive' ? ' selected' : '') + '>Inactive</option><option value="all"' + (q.status === 'all' ? ' selected' : '') + '>All</option></select></div>'
         + '<div><button class="btn" type="submit" style="width:100%">Show</button></div></form>';
       h += d.rows.length ? '<div class="card"><ul class="list">' + d.rows.map(function (u) {
-        return '<li><span class="grow"><b><a href="#/users/' + u.id + '">' + esc(u.full_name) + '</a></b><span class="small muted">' + esc(u.username) + ', ' + esc(u.role_label) + ', ' + esc(u.unit.path) + '<br>' + (u.last_login ? 'Last signed in ' + esc(Z.when(u.last_login)) : 'Has not signed in yet') + '</span></span>'
+        return '<li><span class="grow"><b><a href="#/users/' + u.id + '">' + esc(u.full_name) + '</a></b><span class="small muted">' + (u.username ? esc(u.username) : '<i>username not chosen yet</i>') + ', ' + esc(u.role_label) + ', ' + esc(u.unit.path) + '<br>' + (u.last_login ? 'Last signed in ' + esc(Z.when(u.last_login)) : 'Has not signed in yet') + '</span></span>'
           + (!u.has_password ? '<span class="badge no">No password yet</span>' : '') + (u.status !== 'active' ? '<span class="badge off">Inactive</span>' : '') + '</li>';
       }).join('') + '</ul></div>' : '<div class="card empty">No accounts here yet. <a href="#/users/new">Add one</a>.</div>';
       main.innerHTML = h;
@@ -1059,10 +1065,11 @@ var App = (function () {
 
   function linkBox(d, intro) {
     return '<div class="card pad" id="linkCard"><h2>Pass this link on</h2><p class="small muted">' + esc(intro) + ' It works once and expires in ' + d.hours + ' hour' + (d.hours === 1 ? '' : 's') + '. Send it by phone or message; anyone with the link can set the password.</p>'
-      + '<label class="sr" for="theLink">Sign-in link</label><input type="text" readonly id="theLink" value="' + esc(d.link) + '" onfocus="this.select()"><div class="btn-row" style="margin-top:.6rem"><button type="button" class="btn primary" id="copyLink">Copy link</button></div></div>';
+      + '<label class="sr" for="theLink">Sign-in link</label><input type="text" readonly id="theLink" value="' + esc(d.link) + '"><div class="btn-row" style="margin-top:.6rem"><button type="button" class="btn primary" id="copyLink">Copy link</button></div></div>';
   }
   function wireCopy() {
     var b = $('#copyLink'); if (!b) return;
+    $('#theLink').addEventListener('focus', function () { this.select(); });
     b.addEventListener('click', function () {
       var i = $('#theLink'); i.focus(); i.select();
       var done = function () { b.textContent = 'Copied'; };
@@ -1075,9 +1082,10 @@ var App = (function () {
     var editing = !!u;
     return Z.call('users.list', { status: 'none' }).then(function (meta) {
       var roles = meta.roles;
-      var h = '<div class="page-head"><div><h1>' + (editing ? esc(u.full_name) : sysAdmin() ? 'Add a Zonal Admin' : 'Add a user') + '</h1>' + (editing ? '<p class="small muted">' + esc(u.username) + ', ' + esc(u.role_label) + '. ' + (u.last_login ? 'Last signed in ' + esc(Z.when(u.last_login)) : 'Has not signed in yet') + '.</p>' : '') + '</div>' + Z.closeBtn('#/users') + '</div>';
+      var h = '<div class="page-head"><div><h1>' + (editing ? esc(u.full_name) : sysAdmin() ? 'Add a Zonal Admin' : 'Add a user') + '</h1>' + (editing ? '<p class="small muted">' + esc(u.username || 'No username yet') + ', ' + esc(u.role_label) + '. ' + (u.last_login ? 'Last signed in ' + esc(Z.when(u.last_login)) : 'Has not signed in yet') + '.</p>' : '') + '</div>' + Z.closeBtn('#/users') + '</div>';
       h += '<div class="grid split"><form id="uf" class="card pad" novalidate><div data-form-error></div>';
-      h += editing ? '<p class="small muted">Username: <b>' + esc(u.username) + '</b> (cannot be changed)</p>' : Z.text('username', 'Username', '', 'autocapitalize="none" maxlength="40"', 'Letters, numbers, dots, dashes or underscores.');
+      h += editing ? '<p class="small muted">Username: ' + (u.username ? '<b>' + esc(u.username) + '</b> (cannot be changed)' : '<b>not chosen yet</b>. They choose it when they open their sign-in link.') + '</p>'
+        : '<p class="small muted">You do not choose a username. The person chooses their own when they open the sign-in link you send them.</p>';
       h += Z.text('full_name', 'Full name', editing ? u.full_name : '', 'maxlength="120"') + Z.field('phone', 'Phone number (optional)', '<input type="tel" id="f_phone" name="phone" value="' + esc(editing ? u.phone : '') + '" inputmode="tel">')
         + Z.field('role', 'Role', '<select id="f_role" name="role"><option value="">Choose</option>' + roles.map(function (x) { return '<option value="' + x.role + '"' + (editing && u.role === x.role ? ' selected' : '') + '>' + esc(x.label) + '</option>'; }).join('') + '</select>')
         + '<fieldset><legend>Responsible for</legend><div data-field="unit_id"><div id="unitPick"></div><p class="hint" id="unitHint">Choose a role first.</p></div></fieldset>'
@@ -1102,7 +1110,7 @@ var App = (function () {
       drawPicker(editing ? u.unit.chain : {});
       Z.bindForm($('#uf'), editing ? 'users.update' : 'users.create', function () { return editing ? { id: u.id, stamp: u.stamp } : {}; }, function (d) {
         if (editing) { Z.toast('Changes saved.'); Z.route(); return; }
-        main.innerHTML = '<div class="page-head"><h1>Account created</h1>' + Z.closeBtn('#/users') + '</div><div style="max-width:640px">' + linkBox(d, 'The new user opens this link to choose their own password.') + '</div>';
+        main.innerHTML = '<div class="page-head"><h1>Account created</h1>' + Z.closeBtn('#/users') + '</div><div style="max-width:640px">' + linkBox(d, 'Send this link to the new user. They open it to choose their own username and password.') + '</div>';
         wireCopy();
       });
       if (editing) {
@@ -1313,7 +1321,7 @@ var App = (function () {
 
   var ACTIONS = {
     login: 'Signed in', logout: 'Signed out', login_failed: 'Sign-in failed', login_locked: 'Sign-in blocked after too many tries',
-    password_changed: 'Password changed', password_change_failed: 'Password change refused', password_set: 'Password set from a link', password_link: 'Sign-in link made',
+    password_changed: 'Password changed', password_change_failed: 'Password change refused', password_set: 'Password set from a link', account_set_up: 'Account set up (username and password chosen)', password_link: 'Sign-in link made',
     report_created: 'Report entered', report_corrected: 'Report corrected', report_voided: 'Report voided',
     unit_created: 'Unit added', unit_updated: 'Unit changed', unit_moved: 'Unit moved', unit_deactivated: 'Unit deactivated', unit_reactivated: 'Unit reactivated',
     user_created: 'User added', user_updated: 'User changed', user_deactivated: 'User deactivated', user_reactivated: 'User reactivated',

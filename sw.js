@@ -1,6 +1,6 @@
-// Keeps the screens on the device. Version 5b6007c897.
-var CACHE = 'zas-5b6007c897';
-var SHELL = ["./","index.html","config.js","manifest.webmanifest","styles.css?v=329ee6c5ab","app.js?v=2c466404e5","views.js?v=351a0fd049","picture.js?v=4a3197a23a","boot.js?v=6be60db6d0","icon-192.png","icon-512.png","icon-maskable-512.png","apple-touch-icon.png","favicon.png"];
+// Keeps the screens on the device. Version 2f7ea9f0d3.
+var CACHE = 'zas-2f7ea9f0d3';
+var SHELL = ["./","index.html","config.js","manifest.webmanifest","styles.css?v=329ee6c5ab","app.js?v=2c466404e5","views.js?v=5556392469","picture.js?v=4a3197a23a","boot.js?v=6be60db6d0","icon-192.png","icon-512.png","icon-maskable-512.png","apple-touch-icon.png","favicon.png"];
 self.addEventListener('install', function (e) {
   e.waitUntil(caches.open(CACHE).then(function (c) { return c.addAll(SHELL); }).then(function () { return self.skipWaiting(); }));
 });
