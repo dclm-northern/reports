@@ -747,6 +747,13 @@ var Z = (function () {
       if (!firstBad) firstBad = f;
     });
     if (firstBad) { var inp = $('input,select,textarea', firstBad); if (inp) inp.focus(); }
+    // A message for something that is not on this form (for example when the server is a different
+    // version from the page) is shown in the box at the top, so a problem is never hidden.
+    var stray = Object.keys(fields).filter(function (k) { return k.charAt(0) !== '_' && !$('[data-field="' + k + '"]', form); });
+    if (stray.length && box && box.firstChild) {
+      box.firstChild.innerHTML = esc(firstBad ? err.message : 'This could not be saved:') + clash
+        + '<ul style="margin:.4rem 0 0;padding-left:1.1rem">' + stray.map(function (k) { return '<li>' + esc(fields[k]) + '</li>'; }).join('') + '</ul>';
+    }
   }
   /** Submit a form through the API with a busy button and field errors. */
   function bindForm(form, action, extra, done) {
