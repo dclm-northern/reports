@@ -278,6 +278,7 @@ var Z = (function () {
         + '<div id="askM" class="ask-body">' + (o.message ? '<p>' + esc(o.message) + '</p>' : '')
         + (o.notes && o.notes.length ? '<ul>' + o.notes.map(function (n) { return '<li>' + esc(n) + '</li>'; }).join('') + '</ul>' : '') + (o.after ? '<p>' + esc(o.after) + '</p>' : '') + '</div>'
         + '<div class="ask-foot"><button type="button" class="btn" data-ask="0">' + esc(o.cancel || 'Cancel') + '</button>'
+        + (o.other ? '<button type="button" class="btn" data-ask="2">' + esc(o.other) + '</button>' : '')
         + '<button type="button" class="btn ' + (tone === 'danger' ? 'danger-solid' : 'primary') + '" data-ask="1">' + esc(o.ok || 'OK') + '</button></div></div>';
       document.body.appendChild(box);
       document.body.classList.add('asking');
@@ -295,13 +296,13 @@ var Z = (function () {
         box.parentNode.removeChild(box);
         document.body.classList.remove('asking');
         if (back && back.focus) try { back.focus(); } catch (e) {}
-        resolve(!!yes);
+        resolve(yes === 'other' ? 'other' : !!yes);
       };
       asking = done;
       document.addEventListener('keydown', key, true);
       box.addEventListener('click', function (e) {
         var b = e.target.closest('[data-ask]');
-        if (b) done(b.getAttribute('data-ask') === '1');
+        if (b) done(b.getAttribute('data-ask') === '2' ? 'other' : b.getAttribute('data-ask') === '1');
         else if (e.target === box) done(false);
       });
       // A risky step starts on Cancel; anything else on the main button.
@@ -478,15 +479,33 @@ var Z = (function () {
     drawerOpener = null;
   }
 
-  // Phone numbers: a phone calls them; a computer (mouse, no touch) copies the number instead of asking for a calling app.
+  // Phone numbers: on a computer (mouse) the number is copied; on a phone or tablet a small box offers Call or Copy.
+  function copyNumber(number) {
+    var done = function () { toast('Phone number ' + number + ' copied.'); };
+    var fallback = function () {
+      try {
+        var t = document.createElement('textarea');
+        t.value = number; t.setAttribute('readonly', ''); t.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+        document.body.appendChild(t); t.select(); t.setSelectionRange(0, number.length);
+        var ok = document.execCommand('copy'); document.body.removeChild(t);
+        if (ok) return done();
+      } catch (e) {}
+      toast('Phone number: ' + number);
+    };
+    if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(number).then(done, fallback);
+    else fallback();
+  }
   document.addEventListener('click', function (e) {
     var a = e.target.closest ? e.target.closest('a[href^="tel:"]') : null;
-    if (!a || !window.matchMedia || !matchMedia('(hover: hover) and (pointer: fine)').matches) return;
+    if (!a) return;
     e.preventDefault();
     var number = a.getAttribute('href').substring(4);
-    var done = function () { toast('Phone number ' + number + ' copied.'); };
-    if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(number).then(done, function () { toast('Phone number: ' + number); });
-    else toast('Phone number: ' + number);
+    if (window.matchMedia && matchMedia('(hover: hover) and (pointer: fine)').matches) return copyNumber(number);
+    var shown = (a.textContent || '').trim() || number;
+    ask({ title: shown, message: 'What would you like to do with this number?', ok: 'Call', other: 'Copy number', cancel: 'Cancel' }).then(function (r) {
+      if (r === 'other') copyNumber(number);
+      else if (r === true) location.href = 'tel:' + number;
+    });
   }, true);
 
   document.addEventListener('click', function (e) {
