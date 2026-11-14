@@ -374,7 +374,12 @@ var App = (function () {
     if (r.parts[2] === 'new') return entryForm(main, kind, null);
     if (r.parts[2] && r.parts[3] === 'edit') return Z.call('entry.get', { kind: kind, id: r.parts[2], p: r.q.p }).then(function (rep) { return entryForm(main, kind, rep); });
     if (r.parts[2]) return entryShow(main, kind, r.parts[2], r.q.p);
-    return entryList(main, kind, r);
+    // With no network the lists cannot be read, so go straight to the form.
+    if ((Z.state.offline || Z.state.offlineOnly || navigator.onLine === false) && !sysAdmin()) return entryForm(main, kind, null);
+    return entryList(main, kind, r).catch(function (e) {
+      if (e && e.offline && !sysAdmin()) return entryForm(main, kind, null);   // the network went just now
+      throw e;
+    });
   }
 
   function entryList(main, kind, r) {
@@ -411,8 +416,13 @@ var App = (function () {
   function entryForm(main, kind, rep) {
     return Z.call('entry.setup').then(function (s) {
       var editing = !!rep;
+      // A copy kept on the device may be from an earlier day: never let the date stop at that day.
+      var d0 = new Date(), localToday = d0.getFullYear() + '-' + ('0' + (d0.getMonth() + 1)).slice(-2) + '-' + ('0' + d0.getDate()).slice(-2);
+      if (!editing && localToday > s.today) s.today = localToday;
       var h = '<div class="page-head"><div><h1>' + (editing ? 'Correct ' : 'Enter ') + esc(KIND[kind].one) + '</h1>'
         + (editing ? '<p class="small muted">' + esc(rep.path) + '</p>' : '') + '</div>' + Z.closeBtn(editing ? href('/entry/' + kind + '/' + rep.id, { p: rep.p }) : '#/entry/' + kind) + '</div>';
+      if (!editing) h += '<div class="btn-row" style="margin-bottom:.75rem" role="group" aria-label="Kind of report">' + [['attendance', 'Attendance'], ['hcf', 'HCF'], ['gck', 'GCK'], ['metrics', 'Church Metrics']].map(function (k) {
+        return '<a class="btn small' + (k[0] === kind ? ' primary' : '') + '" href="#/entry/' + k[0] + '/new"' + (k[0] === kind ? ' aria-current="page"' : '') + '>' + k[1] + '</a>'; }).join('') + '</div>';
       h += '<form id="ent" class="card pad" novalidate style="max-width:860px" data-kind="' + kind + '"><div data-form-error></div>';
       if (!editing) {
         if (kind === 'gck' && !s.crusades.length) {

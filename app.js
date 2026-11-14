@@ -124,6 +124,8 @@ var Z = (function () {
   }
   function keepKey(action, payload) {
     if (action === 'me') return 'zas-k:me';
+    // A unit's ID is a number or the same number as text (from a drop-down): one key for both.
+    if (action === 'org.children' && payload) payload = { level: payload.level, parent: payload.parent === null || payload.parent === undefined || payload.parent === '' ? '' : Number(payload.parent) };
     var who = action === 'boot' || action === 'logo' ? 'all' : state.me ? state.me.id : '';
     return 'zas-k:' + who + ':' + action + ':' + JSON.stringify(payload || {});
   }
@@ -135,6 +137,35 @@ var Z = (function () {
   function rememberMe(me) { if (me && me.role !== 'system') ls('zas-k:me', JSON.stringify({ ok: true, data: me })); }
   /** The account last used on this device, for entering reports with no network. */
   function offlineProfile() { var raw = kept('me'); try { var r = raw && JSON.parse(raw); return r && r.ok ? r.data : null; } catch (e) { return null; } }
+
+  /**
+   * While signed in with network, keep on the device everything the report forms need:
+   * the meetings and crusade periods, and every unit the user can choose (down to HCF
+   * locations). Renewed every few hours, so reports (GCK and HCF too) can be entered later with no network.
+   */
+  var preparing = false;
+  function prepare() {
+    if (preparing || !state.token || !state.me || state.offline || state.me.role === 'system') return;
+    var stamp = 'zas-k:prep:' + state.me.id, last = Number(ls(stamp) || 0);
+    if (Date.now() - last < 4 * 3600 * 1000) return;
+    preparing = true;
+    var uid = state.me.id;
+    var jobs = [ask_(state.me.arm ? 'fs.setup' : 'entry.setup', {})];
+    if (!state.me.arm) jobs.push(ask_('org.pack', {}).then(function (rows) {
+      if (!state.me || state.me.id !== uid) return;
+      var groups = {};
+      rows.forEach(function (u) { var k = u.level + '|' + (u.parent === null ? '' : u.parent); (groups[k] = groups[k] || { level: u.level, parent: u.parent === null ? '' : u.parent, list: [] }).list.push({ id: u.id, name: u.name }); });
+      Object.keys(groups).forEach(function (k) {
+        var g = groups[k];
+        g.list.sort(function (a, b) { return String(a.name).localeCompare(String(b.name), undefined, { numeric: true }); });
+        keep('org.children', { level: g.level, parent: g.parent }, JSON.stringify({ ok: true, data: g.list }));
+      });
+      // The first drop-down starts from the user's own unit (or nothing, for the Zone).
+      var st = state.me.picker || {};
+      if (st.level && !groups[st.level + '|' + (st.parent === null || st.parent === undefined ? '' : st.parent)]) keep('org.children', { level: st.level, parent: st.parent }, JSON.stringify({ ok: true, data: [] }));
+    }));
+    Promise.all(jobs).then(function () { ls(stamp, String(Date.now())); }, function () {}).then(function () { preparing = false; });
+  }
 
   function networkIs(up) {
     if (state.offline === !up) return;
@@ -332,7 +363,7 @@ var Z = (function () {
   var visited = [];
   function route() {
     if (!state.me || (!state.token && !state.offlineOnly)) return;
-    if (state.token) setTimeout(flush, 0);
+    if (state.token) { setTimeout(flush, 0); setTimeout(prepare, 1500); }
     var here = location.hash || '#/';
     if (visited[visited.length - 1] !== here) visited.push(here);
     if (visited.length > 50) visited.shift();
