@@ -753,7 +753,13 @@ var App = (function () {
     if (r.parts[1] === 'entry' && r.parts[2] && r.parts[3] === 'edit') return Z.call('fs.get', { id: r.parts[2], p: r.q.p }).then(function (x) { return fsForm(main, arm, x, r.q); });
     if (r.parts[1] === 'entry' && r.parts[2]) return fsShow(main, arm, r.parts[2], r.q.p);
     var q = r.q;
-    return Z.call('fs.list', { month: q.month || thisMonth(), status: q.status, type: q.type }).then(function (d) {
+    // With no network the list cannot be read, so go straight to the form.
+    if (Z.state.offline || Z.state.offlineOnly || navigator.onLine === false) return fsForm(main, arm, null, q);
+    return Z.call('fs.list', { month: q.month || thisMonth(), status: q.status, type: q.type }).catch(function (e) {
+      if (e && e.offline) return null;   // the network went just now
+      throw e;
+    }).then(function (d) {
+      if (!d) return fsForm(main, arm, null, q);
       var h = '<div class="page-head"><div><h1>' + esc(d.label.code) + ' reports</h1><p class="small muted">' + num(d.total) + ' report' + (d.total === 1 ? '' : 's') + ' in ' + esc(monthLabel(d.month)) + '. Open a report to correct' + (Z.state.me.visitor ? '' : ', void or delete') + ' it.</p></div><a class="btn primary" href="#/fs/entry/new">Enter a report</a></div>'
         + '<form class="filters" id="fe"><div><label for="fe_m">Month</label><input type="month" id="fe_m" name="month" value="' + esc(d.month) + '" max="' + esc(thisMonth()) + '"></div>'
         + '<div><label for="fe_t">Meeting</label><select id="fe_t" name="type"><option value="">All meetings</option>' + Z.state.me.fsTypes.map(function (t) { return '<option value="' + t.id + '"' + (Number(q.type) === t.id ? ' selected' : '') + '>' + esc(t.code) + '</option>'; }).join('') + '</select></div>'
@@ -771,6 +777,9 @@ var App = (function () {
   function fsForm(main, arm, x, q) {
     var editing = !!x;
     return Z.call('fs.setup').then(function (s) {
+      // A copy kept on the device may be from an earlier day: never let the date stop at that day.
+      var d0 = new Date(), localToday = d0.getFullYear() + '-' + ('0' + (d0.getMonth() + 1)).slice(-2) + '-' + ('0' + d0.getDate()).slice(-2);
+      if (!x && localToday > s.today) s.today = localToday;
       var A = s.label;
       var h = '<div class="page-head"><div><h1>' + (editing ? 'Correct ' : 'Enter ') + esc(A.code) + ' report</h1>' + (editing ? '<p class="small muted">' + esc(x.institution) + ', ' + esc(x.path) + '</p>' : '') + '</div>'
         + Z.closeBtn(editing ? href('/fs/entry/' + x.id, { p: x.p }) : '#/fs/entry') + '</div>';
