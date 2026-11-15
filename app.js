@@ -443,7 +443,7 @@ var Z = (function () {
         out += '<a href="#' + it[0] + '"' + (on ? ' class="on" aria-current="page"' : '') + '>' + esc(it[1]) + '</a>';
       });
     });
-    out += '<div class="signout"><button type="button" class="btn small" data-signout>' + icon('out') + 'Sign out</button></div></nav>';
+    out += '<div class="signout"><button type="button" class="btn small danger-solid" data-signout>' + icon('out') + 'Sign out</button></div></nav>';
     return out;
   }
   function shell(r) {
@@ -455,7 +455,8 @@ var Z = (function () {
         + '<a class="brand" href="#/"><span class="logo">' + logoHtml() + '</span><span class="brand-text"><b>' + esc(me.settings.app_name)
         + '</b><span>' + esc(me.settings.church) + '</span></span></a>'
         + '<a class="outbox-pill hidden" id="outboxPill" href="#/outbox" aria-live="polite"></a>'
-        + '<button type="button" class="icon-btn" data-theme-toggle></button></header>'
+        + '<button type="button" class="icon-btn" data-theme-toggle></button>'
+        + '<button type="button" class="btn small danger-solid top-out" data-signout aria-label="Sign out">' + icon('out') + '<span>Sign out</span></button></header>'
         + '<div class="layout"><aside class="side" id="side"></aside><main class="main" id="main" tabindex="-1"></main></div>'
         + '<nav class="bottom" aria-label="Shortcuts" id="bottom"></nav>';
       $$('[data-theme-toggle]').forEach(labelThemeButton);
