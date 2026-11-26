@@ -51,7 +51,7 @@ var Z = (function () {
   // How long to wait for the server before treating the signal as gone. A new report is safe to
   // keep on the device after WAIT_SAVE (its one-time reference stops a second copy if the first
   // did arrive); signing in gives up after WAIT_LOGIN; reports and other pages wait longer.
-  var WAIT_SAVE = 20000, WAIT_LOGIN = 25000, WAIT_OTHER = 90000, WAIT_KEPT = 6000;
+  var WAIT_SAVE = 20000, WAIT_LOGIN = 25000, WAIT_OTHER = 90000, WAIT_KEPT = 6000, WAIT_SAVED = 9000;
   var SAVES = { 'entry.create': 1, 'fs.create': 1 };
   function send(action, payload) {
     if (window.ZAS_API) {
@@ -81,12 +81,14 @@ var Z = (function () {
   }
 
   function call(action, payload) {
+    // With no session (working offline after the password was checked on this device), only
+    // the copies kept here can answer: do not wait for a network that cannot sign anyone in.
+    if (state.offlineOnly && !state.token && action !== 'login' && action !== 'boot' && action !== 'picture' && action !== 'logo') return fromDevice(action, payload, { message: UNREACHABLE, offline: true });
     var req = ask_(action, payload);
     // What the forms need and is kept on the device: on a weak signal, use the kept copy after a
     // few seconds instead of waiting, and let the fresh answer update the copy when it arrives.
     var copy = KEEP[action] ? kept(action, payload) : null;
-    if (!copy) return req;
-    return new Promise(function (resolve, reject) {
+    if (copy) return new Promise(function (resolve, reject) {
       var settled = false;
       var timer = setTimeout(function () {
         try { var r = JSON.parse(copy); if (r.ok) { settled = true; networkIs(false); resolve(r.data); } } catch (e) {}
@@ -94,24 +96,57 @@ var Z = (function () {
       req.then(function (d) { clearTimeout(timer); if (!settled) { settled = true; resolve(d); } },
         function (e) { clearTimeout(timer); if (!settled) { settled = true; reject(e); } });
     });
+    if (!SAVED[action] || !Local.ready()) return req;
+    // A page saved on this device: on a weak signal show the saved copy after WAIT_SAVED instead
+    // of a spinner, and offer the fresh figures when they arrive.
+    return new Promise(function (resolve, reject) {
+      var settled = false, here = location.hash;
+      var timer = setTimeout(function () {
+        Local.loadPage(action, payload).then(function (c) {
+          if (!c || settled) return;
+          settled = true; noteStale(c.at); resolve(c.data);
+        }).catch(function () {});
+      }, WAIT_SAVED);
+      req.then(function (d) {
+        clearTimeout(timer);
+        if (!settled) { settled = true; resolve(d); return; }
+        if (location.hash === here) notify('Newer figures have arrived.', 'Show them', function () { route(); });
+      }, function (e) { clearTimeout(timer); if (!settled) { settled = true; reject(e); } });
+    });
   }
   function ask_(action, payload) {
     return send(action, payload).then(function (raw) {
       var r;
       try { r = JSON.parse(raw); } catch (e) { throw { message: 'The server sent an answer that could not be read.' }; }
       networkIs(true);
-      if (r.ok) { if (KEEP[action] && !(action === 'me' && r.data && r.data.role === 'system')) keep(action, payload, raw); return r.data; }
-      if (r.code === 'SESSION' && action !== 'login') signedOut(r.message);
+      if (r.ok) {
+        if (KEEP[action] && !(action === 'me' && r.data && r.data.role === 'system')) keep(action, payload, raw);
+        if (SAVED[action]) Local.savePage(action, payload, r.data);
+        return r.data;
+      }
+      if (r.code === 'SESSION' && action !== 'login') signedOut(state.offlineOnly ? 'The network is back. Sign in to send the reports waiting on this device and to see the latest figures.' : r.message);
       throw r;
     }, function (err) {
       if (err && err.offline) {
         networkIs(false);
-        var hit = KEEP[action] ? kept(action, payload) : null;
-        if (hit) { try { var r = JSON.parse(hit); if (r.ok) return r.data; } catch (e) {} }
+        return fromDevice(action, payload, err);
       }
       throw err;
     });
   }
+  /** The answer kept on this device for a request that could not reach the server, or the error. */
+  function fromDevice(action, payload, err) {
+    var hit = KEEP[action] ? kept(action, payload) : null;
+    if (hit) { try { var r = JSON.parse(hit); if (r.ok) return Promise.resolve(r.data); } catch (e) {} }
+    if (!SAVED[action] || !Local.ready()) return Promise.reject(err);
+    return Local.loadPage(action, payload).then(function (c) {
+      if (!c) throw err;
+      noteStale(c.at);
+      return c.data;
+    }, function () { throw err; });
+  }
+  /** A page drawn from a saved copy says so at the top, with the time it was saved. */
+  function noteStale(at) { state.staleAt = state.staleAt ? Math.min(state.staleAt, at) : at; }
 
   // ------------------------------------------------------------------ working without network
   // What the report forms need is kept on the device, so they can be filled in with no network:
@@ -119,6 +154,193 @@ var Z = (function () {
   // device (at most LIMIT of them) and are sent, each with a one-time reference, when it returns.
   var KEEP = { 'boot': 1, 'logo': 1, 'me': 1, 'entry.setup': 1, 'fs.setup': 1, 'org.children': 1 };
   var LIMIT = 200, OUTBOX = 'zas-outbox';
+  // Pages that can be read again with no network: the last answer for each is kept on the
+  // device, encrypted with a key made from the person's password (see Local below). Account
+  // and system pages are never kept.
+  var SAVED = {};
+  ['dashboard', 'report', 'entry.list', 'entry.get', 'org.list', 'org.list.hcf', 'org.get', 'org.search', 'fs.home', 'fs.institutions', 'fs.institution',
+    'fs.list', 'fs.get', 'fs.report', 'overview', 'heads.units', 'heads.get', 'groups.list', 'groups.get', 'groups.districts', 'admin.types', 'admin.crusades', 'zone.leader']
+    .forEach(function (a) { SAVED[a] = 1; });
+
+  // ------------------------------------------------------------------ copies kept on this device
+  /**
+   * Local keeps pages for reading with no network, in the browser's database (IndexedDB),
+   * encrypted (AES-GCM) with a key made from the person's password (PBKDF2, many rounds).
+   * Without the password the copies cannot be read, even by someone holding the phone.
+   * The same key lets the password be checked on the device, so with no network a person
+   * signs in as usual and works offline; nobody can do that without the password.
+   * Signing out deletes the person's copies from the device.
+   */
+  var Local = (function () {
+    var ITER = 150000, KEEP_DAYS = 30, MAX_PAGES = 400;
+    var subtle = window.crypto && window.crypto.subtle && window.isSecureContext !== false ? window.crypto.subtle : null;
+    var key = null, keyUid = null, dbp = null, saves = 0;
+    var enc = window.TextEncoder ? new TextEncoder() : null, dec = window.TextDecoder ? new TextDecoder() : null;
+
+    function db() {
+      if (dbp) return dbp;
+      dbp = new Promise(function (resolve, reject) {
+        if (!window.indexedDB) { reject(new Error('No database in this browser')); return; }
+        var rq;
+        try { rq = indexedDB.open('zas', 1); } catch (e) { reject(e); return; }
+        rq.onupgradeneeded = function () { var d = rq.result; ['pages', 'visits', 'media'].forEach(function (n) { if (!d.objectStoreNames.contains(n)) d.createObjectStore(n); }); };
+        rq.onsuccess = function () { resolve(rq.result); };
+        rq.onerror = function () { reject(rq.error); };
+        rq.onblocked = function () { reject(new Error('The database is busy in another tab')); };
+      });
+      dbp.catch(function () { dbp = null; });
+      return dbp;
+    }
+    function tx(store, mode, fn) {
+      return db().then(function (d) {
+        return new Promise(function (resolve, reject) {
+          var t = d.transaction(store, mode), rq = fn(t.objectStore(store));
+          t.oncomplete = function () { resolve(rq && rq.result !== undefined ? rq.result : null); };
+          t.onerror = t.onabort = function () { reject(t.error); };
+        });
+      });
+    }
+    function get(store, k) { return tx(store, 'readonly', function (s) { return s.get(k); }); }
+    function put(store, k, v) { return tx(store, 'readwrite', function (s) { return s.put(v, k); }); }
+    function del(store, k) { return tx(store, 'readwrite', function (s) { return s.delete(k); }); }
+    /** Every record of a store as [{ key, value }]. */
+    function list(store) {
+      return db().then(function (d) {
+        return new Promise(function (resolve, reject) {
+          var out = [], t = d.transaction(store, 'readonly'), rq = t.objectStore(store).openCursor();
+          rq.onsuccess = function () { var c = rq.result; if (c) { out.push({ key: c.key, value: c.value }); c.continue(); } };
+          t.oncomplete = function () { resolve(out); };
+          t.onerror = t.onabort = function () { reject(t.error); };
+        });
+      });
+    }
+
+    function b64(buf) { var s = '', a = new Uint8Array(buf); for (var i = 0; i < a.length; i++) s += String.fromCharCode(a[i]); return btoa(s); }
+    function unb64(s) { var b = atob(s), a = new Uint8Array(b.length); for (var i = 0; i < b.length; i++) a[i] = b.charCodeAt(i); return a; }
+    function derive(password, salt, iter) {
+      return subtle.importKey('raw', enc.encode(String(password)), 'PBKDF2', false, ['deriveKey']).then(function (k) {
+        return subtle.deriveKey({ name: 'PBKDF2', salt: salt, iterations: iter || ITER, hash: 'SHA-256' }, k, { name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+      });
+    }
+    function seal(k, obj) {
+      var iv = window.crypto.getRandomValues(new Uint8Array(12));
+      return subtle.encrypt({ name: 'AES-GCM', iv: iv }, k, enc.encode(JSON.stringify(obj))).then(function (ct) { return { iv: iv, ct: ct }; });
+    }
+    function unseal(k, box) { return subtle.decrypt({ name: 'AES-GCM', iv: box.iv }, k, box.ct).then(function (pt) { return JSON.parse(dec.decode(pt)); }); }
+
+    var VAULT = 'zas-vault:';
+    function vaultOf(username) { try { return JSON.parse(localStorage.getItem(VAULT + String(username || '').trim().toLowerCase()) || 'null'); } catch (e) { return null; } }
+    function holdKey(k, uid) {
+      key = k; keyUid = uid;
+      // Kept for this tab only (like the session itself), so a reload does not lose it.
+      return subtle.exportKey('raw', k).then(function (raw) { try { sessionStorage.setItem('zas-vk', JSON.stringify({ uid: uid, k: b64(raw) })); } catch (e) {} });
+    }
+    /** Check a password against the copy of the account kept on this device. */
+    function check(v, password) {
+      return derive(password, unb64(v.salt), v.iter).then(function (k) {
+        return unseal(k, { iv: unb64(v.iv), ct: unb64(v.ct) }).then(function (c) { if (c.uid !== v.uid) throw new Error('mismatch'); return k; });
+      });
+    }
+
+    return {
+      supported: function () { return !!(subtle && enc && window.indexedDB); },
+      ready: function () { return !!(key && state.me && keyUid === state.me.id && state.me.role !== 'system'); },
+
+      /** After signing in with the network: make (or confirm) this device's key for the person. */
+      unlock: function (me, password) {
+        if (!this.supported() || !me || me.role === 'system') return Promise.resolve(false);
+        var v = vaultOf(me.username);
+        var fresh = function () {
+          var salt = window.crypto.getRandomValues(new Uint8Array(16));
+          return derive(password, salt).then(function (k) {
+            return seal(k, { uid: me.id, user: me.username }).then(function (box) {
+              try { localStorage.setItem(VAULT + me.username.toLowerCase(), JSON.stringify({ uid: me.id, salt: b64(salt), iter: ITER, iv: b64(box.iv), ct: b64(box.ct) })); } catch (e) { return false; }
+              // Copies made with an older password can no longer be read: remove them.
+              return Local.wipe(me.id, true).then(function () { return holdKey(k, me.id); }).then(function () { return true; });
+            });
+          });
+        };
+        if (!v || v.uid !== me.id) return fresh().catch(function () { return false; });
+        return check(v, password).then(function (k) { return holdKey(k, me.id).then(function () { return true; }); }, fresh).catch(function () { return false; });
+      },
+
+      /** With no network: check the password on the device. Resolves with the person's ID. */
+      unlockOffline: function (username, password) {
+        if (!this.supported()) return Promise.reject({ none: true });
+        var v = vaultOf(username);
+        if (!v) return Promise.reject({ none: true });
+        return check(v, password).then(function (k) { return holdKey(k, v.uid).then(function () { return v.uid; }); }, function () { throw { wrong: true }; });
+      },
+
+      /** On opening the page again in the same tab: take the key back. */
+      restore: function () {
+        if (!this.supported()) return Promise.resolve(false);
+        var s = null;
+        try { s = JSON.parse(sessionStorage.getItem('zas-vk') || 'null'); } catch (e) {}
+        if (!s) return Promise.resolve(false);
+        return subtle.importKey('raw', unb64(s.k), { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']).then(function (k) { key = k; keyUid = s.uid; return true; }, function () { return false; });
+      },
+
+      lock: function () { key = null; keyUid = null; try { sessionStorage.removeItem('zas-vk'); } catch (e) {} },
+
+      savePage: function (action, payload, data) {
+        if (!this.ready()) return;
+        var uid = state.me.id, k = uid + '|' + action + '|' + JSON.stringify(payload || {}), at = Date.now();
+        seal(key, { data: data, at: at }).then(function (box) { return put('pages', k, { uid: uid, at: at, box: box }); })
+          .then(function () { if (++saves % 40 === 1) Local.prune(uid); }).catch(function () {});
+      },
+
+      loadPage: function (action, payload) {
+        if (!this.ready()) return Promise.resolve(null);
+        var k = state.me.id + '|' + action + '|' + JSON.stringify(payload || {});
+        return get('pages', k).then(function (rec) { return rec ? unseal(key, rec.box) : null; });
+      },
+
+      /** Remember a page that was shown with fresh figures, so it can be offered with no network. */
+      saveVisit: function (hash, title) {
+        if (!this.ready()) return;
+        var uid = state.me.id;
+        seal(key, { hash: hash, title: title }).then(function (box) { return put('visits', uid + '|' + hash, { uid: uid, at: Date.now(), box: box }); }).catch(function () {});
+      },
+
+      visits: function () {
+        if (!this.ready()) return Promise.resolve([]);
+        var uid = state.me.id, k = key;
+        return list('visits').then(function (all) {
+          var mine = all.filter(function (x) { return x.value.uid === uid; }).sort(function (a, b) { return b.value.at - a.value.at; }).slice(0, 25);
+          return Promise.all(mine.map(function (x) { return unseal(k, x.value.box).then(function (v) { v.at = x.value.at; return v; }, function () { return null; }); }));
+        }).then(function (l) { return l.filter(Boolean); }).catch(function () { return []; });
+      },
+
+      /** Keep at most MAX_PAGES copies per person, none older than KEEP_DAYS. */
+      prune: function (uid) {
+        var old = Date.now() - KEEP_DAYS * 86400000;
+        ['pages', 'visits'].forEach(function (store) {
+          list(store).then(function (all) {
+            var mine = all.filter(function (x) { return x.value.uid === uid; }).sort(function (a, b) { return b.value.at - a.value.at; });
+            mine.forEach(function (x, i) { if (i >= MAX_PAGES || x.value.at < old) del(store, x.key); });
+          }).catch(function () {});
+        });
+      },
+
+      /** Delete everything kept for a person (on signing out); keepVault leaves the password check. */
+      wipe: function (uid, keepVault) {
+        if (!keepVault) {
+          try { Object.keys(localStorage).forEach(function (k) { if (k.indexOf(VAULT) === 0) { var v = JSON.parse(localStorage.getItem(k) || 'null'); if (!v || v.uid === uid) localStorage.removeItem(k); } }); } catch (e) {}
+        }
+        if (!window.indexedDB) return Promise.resolve();
+        return Promise.all(['pages', 'visits'].map(function (store) {
+          return list(store).then(function (all) { return Promise.all(all.filter(function (x) { return x.value.uid === uid; }).map(function (x) { return del(store, x.key); })); });
+        })).catch(function () {});
+      },
+
+      /** Public pictures (the logo, the sign-in picture), kept as they are with their version. */
+      media: function (name, v, data) {
+        if (data === undefined) return get('media', name).then(function (m) { return m && m.v === v ? m.data : null; }).catch(function () { return null; });
+        return put('media', name, { v: v, data: data }).catch(function () {});
+      }
+    };
+  })();
   function ls(k, v) {
     try { if (v === undefined) return localStorage.getItem(k); if (v === null) localStorage.removeItem(k); else localStorage.setItem(k, v); return true; } catch (e) { return v === undefined ? null : false; }
   }
@@ -194,7 +416,7 @@ var Z = (function () {
     if (list.length >= LIMIT) throw { message: 'This device is already keeping ' + LIMIT + ' reports waiting for the network, which is the most it keeps. They are sent as soon as there is network; then you can enter more.' };
     var p = {};
     Object.keys(payload).forEach(function (k) { if (k !== 'confirmed' && k !== 'client_ref') p[k] = payload[k]; });
-    var item = { ref: payload.client_ref || newRef(), uid: state.me.id, user: state.me.full_name, action: action, payload: p, label: label || {}, at: new Date().toISOString(), status: 'waiting', review: !state.token };
+    var item = { ref: payload.client_ref || newRef(), uid: state.me.id, user: state.me.full_name, action: action, payload: p, label: label || {}, at: new Date().toISOString(), status: 'waiting', review: !state.token && !state.vaultOK };
     list.push(item);
     if (!boxSave(list)) throw { message: 'This report could not be kept on the device: its storage is full or switched off (for example in a private window). It has not been saved. Write the figures down and enter them when there is network.' };
     badge();
@@ -235,6 +457,8 @@ var Z = (function () {
     }, function () { flushing = false; return 0; });
   }
   window.addEventListener('online', function () { setTimeout(flush, 1500); });
+  // Phones pause pages in the background: try again as soon as the system is in front again.
+  document.addEventListener('visibilitychange', function () { if (!document.hidden && navigator.onLine !== false) setTimeout(flush, 800); });
   setInterval(function () { if (navigator.onLine !== false) flush(); }, 60 * 1000);
 
   /** The marker in the top bar: no network, reports waiting, reports needing attention. */
@@ -255,7 +479,8 @@ var Z = (function () {
 
   function signedOut(message) {
     closeDrawer();
-    state.token = null; state.me = null; state.cache = {}; state.offlineOnly = false;
+    state.token = null; state.me = null; state.cache = {}; state.offlineOnly = false; state.vaultOK = false;
+    Local.lock();
     try { sessionStorage.removeItem('zas-token'); } catch (e) {}
     App.login(message);
   }
@@ -376,7 +601,15 @@ var Z = (function () {
     main.focus({ preventScroll: true });
     window.scrollTo(0, 0);
     var view = Views.find(r);
-    Promise.resolve().then(function () { return view(main, r); }).catch(function (e) { showError(main, e); }).then(function () { pageTitle(main); });
+    state.staleAt = null;
+    laterRows = {};
+    var ticket = state.ticket = (state.ticket || 0) + 1, failed = false;
+    Promise.resolve().then(function () { return view(main, r); }).catch(function (e) { failed = true; return showError(main, e); }).then(function () {
+      if (ticket !== state.ticket) return;   // another page was opened meanwhile
+      pageTitle(main);
+      if (state.staleAt) staleBanner(main, state.staleAt);
+      else if (!failed && state.token && !/^\/(admin|users|account|outbox)/.test(r.path)) Local.saveVisit(here, document.title.split(' · ')[0]);
+    });
   }
   function pageTitle(main) {
     var h = main.querySelector('h1');
@@ -384,14 +617,43 @@ var Z = (function () {
     document.title = h && h.textContent.trim() ? h.textContent.trim() + ' · ' + name : name;
     edges(main);
   }
+  /** The line at the top of a page drawn from a copy kept on this device. */
+  function staleBanner(main, at) {
+    var d = new Date(at), p = function (n) { return (n < 10 ? '0' : '') + n; };
+    var stamp = d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+    var div = document.createElement('div');
+    div.className = 'notice warn stale no-print'; div.setAttribute('role', 'status');
+    div.innerHTML = '<b>' + (state.offline || state.offlineOnly ? 'No network.' : 'The network is slow.') + '</b> This is the copy saved on this device on ' + esc(when(stamp)) + '. Figures entered since then are not in it.';
+    main.insertBefore(div, main.firstChild);
+  }
+  /** A message with one button, for things the person may want to act on (a newer version, newer figures). */
+  function notify(message, label, fn) {
+    var old = $('#notify'); if (old) old.remove();
+    var n = document.createElement('div');
+    n.id = 'notify'; n.className = 'notify'; n.setAttribute('role', 'status');
+    n.innerHTML = '<span>' + esc(message) + '</span>' + (label ? '<button type="button" class="btn small primary">' + esc(label) + '</button>' : '') + '<button type="button" class="icon-btn" aria-label="Dismiss">' + icon('close') + '</button>';
+    document.body.appendChild(n);
+    var bs = n.querySelectorAll('button');
+    if (label) bs[0].addEventListener('click', function () { n.remove(); fn(); });
+    bs[bs.length - 1].addEventListener('click', function () { n.remove(); });
+    setTimeout(function () { if (n.parentNode) n.remove(); }, 20000);
+  }
 
   function showError(el, e) {
     if (e && e.code === 'SESSION') return;
     if (e && e.offline) {
       var enter = state.me && state.me.arm ? '#/fs/entry/new' : '#/entry/attendance/new';
-      el.innerHTML = '<h1>No network</h1><div class="notice warn" role="status">This page needs the network, and this device cannot reach the server just now.</div>'
-        + (state.me && state.me.role !== 'system' ? '<p>You can still enter reports. They wait on this device and are sent by themselves as soon as the network returns.</p><div class="btn-row"><a class="btn primary" href="' + enter + '">Enter a report</a><a class="btn" href="#/outbox">Reports waiting to be sent</a></div>' : '<p>Try again when the device is connected.</p>');
-      return;
+      el.innerHTML = '<h1>No network</h1><div class="notice warn" role="status">This page has not been opened on this device before, and the server cannot be reached just now.</div>'
+        + (state.me && state.me.role !== 'system' ? '<p>You can still enter reports. They wait on this device and are sent by themselves as soon as the network returns.</p><div class="btn-row"><a class="btn primary" href="' + enter + '">Enter a report</a><a class="btn" href="#/outbox">Reports waiting to be sent</a></div>' : '<p>Try again when the device is connected.</p>')
+        + '<div id="savedPages"></div>';
+      return Local.visits().then(function (v) {
+        var box = $('#savedPages', el);
+        v = v.filter(function (x) { return /^#\/[^"<>]*$/.test(x.hash || ''); });
+        if (!box || !v.length) return;
+        box.innerHTML = '<h2 style="margin:1.2rem 0 .5rem">Pages saved on this device</h2><p class="small muted">These open with no network, as they were when last seen.</p><div class="card"><ul class="list">'
+          + v.map(function (x) { return '<li><span class="grow"><b><a href="' + esc(x.hash) + '">' + esc(x.title || x.hash) + '</a></b><span class="small muted">Saved ' + esc(when(new Date(x.at - new Date().getTimezoneOffset() * 60000).toISOString())) + '</span></span></li>'; }).join('')
+          + '</ul></div>';
+      });
     }
     el.innerHTML = '<h1>' + esc(e && e.code === 'FORBIDDEN' ? 'No access' : 'This page could not be shown') + '</h1><div class="notice bad" role="alert">' + esc(e && e.message ? e.message : 'Something went wrong.') + '</div>'
       + '<p><a href="#/">Back to the dashboard</a></p>';
@@ -468,8 +730,8 @@ var Z = (function () {
       : [['/', 'Home', 'home', p === '/'], me.role === 'system' ? ['/admin/maintenance', 'System', 'edit', p.indexOf('/admin') === 0 || p.indexOf('/users') === 0] : ['/entry/attendance', 'Enter', 'edit', p.indexOf('/entry') === 0],
       ['/reports/attendance', 'Reports', 'chart', p.indexOf('/reports') === 0 && p !== '/reports/pastors' && p !== '/reports/locations' && p !== '/reports/heads']];
     $('#bottom').innerHTML = tabs.map(function (t) {
-      return '<a href="#' + t[0] + '"' + (t[3] ? ' class="on" aria-current="page"' : '') + '>' + icon(t[2]) + '<span>' + t[1] + '</span></a>';
-    }).join('') + '<button type="button" data-open-menu>' + icon('more') + '<span>More</span></button>';
+      return '<a href="#' + t[0] + '" aria-label="' + t[1] + '"' + (t[3] ? ' class="on" aria-current="page"' : '') + '>' + icon(t[2]) + '<span>' + t[1] + '</span></a>';
+    }).join('') + '<button type="button" data-open-menu aria-label="More">' + icon('more') + '<span>More</span></button>';
   }
   function logoHtml() {
     return state.logo ? '<img src="' + esc(state.logo) + '" alt="">' : esc((state.me ? state.me.settings.zone : BOOT.appName || 'Z').charAt(0));
@@ -552,7 +814,8 @@ var Z = (function () {
         .then(function (yes) {
           if (!yes) return;
           forgetKept();
-          (state.token ? call('logout').catch(function () {}) : Promise.resolve()).then(function () { signedOut('You have signed out.'); });
+          var uid = state.me && state.me.id;
+          (state.token ? call('logout').catch(function () {}) : Promise.resolve()).then(function () { return uid ? Local.wipe(uid) : null; }).then(function () { signedOut('You have signed out.'); });
         });
     }
     else if (t.hasAttribute('data-print')) window.print();
@@ -605,38 +868,85 @@ var Z = (function () {
     });
     return out;
   }
+  /*
+   * Long tables are drawn in two steps: the first FIRST_ROWS rows at once, the rest when asked
+   * (and always before printing), so a report of thousands of HCF locations opens quickly on a
+   * phone. On a phone a table with few columns is shown as cards (label and value on each line);
+   * a button switches between cards and the full table, and the choice is remembered.
+   */
+  var FIRST_ROWS = 250, CARD_COLS = 9, laterRows = {}, laterSeq = 0;
+  function viewPref() { return ls('zas-view') || 'auto'; }
   function tableHtml(t, linkFor) {
     var edges = {};
     if (t.groups) { var a = 0; t.groups.forEach(function (g) { edges[a] = 1; a += g.span; }); }
     var lead = t.groups ? t.groups[0].span : 0;
     var cls = function (c, i) { return (c.type === 'edit' ? 'no-print ' : '') + (NUMERIC[c.type] ? '' : 'text') + (c.strong ? ' strong' : '') + (edges[i] && i >= lead && i > 0 ? ' edge' : ''); };
-    var h = '<div class="table-box"><div class="table-wrap" tabindex="0" role="region" aria-label="' + esc(t.heading || t.title || 'Table') + '"><table class="data"><thead>';
+    // Each cell carries its column's name (with its group's), for the card view on phones.
+    var groupOf = [];
+    if (t.groups) { var at = 0; t.groups.forEach(function (g) { for (var j = 0; j < g.span; j++) groupOf[at + j] = g.label || ''; at += g.span; }); }
+    var labels = t.columns.map(function (c, i) { return ((groupOf[i] && i >= lead ? groupOf[i] + ' ' : '') + (c.full || c.label)).trim(); });
+    var shown = t.columns.filter(function (c) { return c.type !== 'edit'; }).length;
+    var pref = viewPref(), cards = pref === 'cards' || (pref === 'auto' && (shown <= CARD_COLS || t.rows.length <= 5));
+    var rowHtml = function (row) {
+      var s = '<tr' + (row._class ? ' class="' + esc(row._class) + '"' : '') + '>';
+      t.columns.forEach(function (c, i) {
+        if (i === 0) {
+          var inner = cellHtml(c, row);
+          var l = row._link && linkFor ? linkFor(row._link) : null;
+          s += '<th scope="row">' + (l ? '<a href="' + esc(l) + '">' + inner + '</a>' : inner) + '</th>';
+        } else s += '<td class="' + cls(c, i) + '" data-label="' + esc(labels[i]) + '">' + cellHtml(c, row) + '</td>';
+      });
+      return s + '</tr>';
+    };
+    var h = '<div class="table-box' + (cards ? ' cards' : '') + '"><button type="button" class="view-toggle no-print" data-view-toggle aria-pressed="' + (cards ? 'true' : 'false') + '">' + (cards ? 'Show as a table' : 'Show as cards') + '</button>'
+      + '<div class="table-wrap" tabindex="0" role="region" aria-label="' + esc(t.heading || t.title || 'Table') + '"><table class="data"><thead>';
     if (t.groups) {
       h += '<tr class="group-row">' + t.groups.map(function (g) { return g.label ? '<th scope="colgroup" colspan="' + g.span + '">' + esc(g.label) + '</th>' : '<td colspan="' + g.span + '"></td>'; }).join('') + '</tr>';
     }
     h += '<tr>' + t.columns.map(function (c, i) {
       return '<th scope="col" class="' + cls(c, i) + '"' + (c.full ? ' title="' + esc(c.full) + '"' : '') + '>' + (c.full ? '<abbr title="' + esc(c.full) + '">' + esc(c.label) + '</abbr>' : esc(c.label)) + '</th>';
     }).join('') + '</tr></thead><tbody>';
-    t.rows.forEach(function (row) {
-      h += '<tr' + (row._class ? ' class="' + esc(row._class) + '"' : '') + '>';
-      t.columns.forEach(function (c, i) {
-        if (i === 0) {
-          var inner = cellHtml(c, row);
-          var l = row._link && linkFor ? linkFor(row._link) : null;
-          h += '<th scope="row">' + (l ? '<a href="' + esc(l) + '">' + inner + '</a>' : inner) + '</th>';
-        } else h += '<td class="' + cls(c, i) + '">' + cellHtml(c, row) + '</td>';
-      });
-      h += '</tr>';
-    });
+    var cut = t.rows.length > FIRST_ROWS + 100 ? FIRST_ROWS : t.rows.length;
+    for (var r = 0; r < cut; r++) h += rowHtml(t.rows[r]);
+    if (cut < t.rows.length) {
+      var id = 'm' + (++laterSeq);
+      laterRows[id] = { rows: t.rows.slice(cut), draw: rowHtml };
+      h += '<tr class="more-rows no-print" data-later="' + id + '"><td colspan="' + t.columns.length + '"><button type="button" class="btn small" data-more-rows="' + id + '">Show the other ' + num(t.rows.length - cut) + ' rows</button></td></tr>';
+    }
     h += '</tbody>';
     if (t.totals) {
       h += '<tfoot><tr>' + t.columns.map(function (c, i) {
         var inner = c.type === 'mark' ? '' : cellHtml(c, t.totals);
-        return i === 0 ? '<th scope="row">' + inner + '</th>' : '<td class="' + cls(c, i) + '">' + inner + '</td>';
+        return i === 0 ? '<th scope="row">' + inner + '</th>' : '<td class="' + cls(c, i) + '" data-label="' + esc(labels[i]) + '">' + inner + '</td>';
       }).join('') + '</tr></tfoot>';
     }
     return h + '</table></div></div>';
   }
+  /** Draw the rest of a long table. */
+  function moreRows(id) {
+    var tr = document.querySelector('tr[data-later="' + id + '"]'), job = laterRows[id];
+    if (!tr || !job) return;
+    tr.insertAdjacentHTML('afterend', job.rows.map(job.draw).join(''));
+    tr.remove();
+    delete laterRows[id];
+    edges(document);
+  }
+  document.addEventListener('click', function (e) {
+    var b = e.target.closest ? e.target.closest('[data-more-rows],[data-view-toggle]') : null;
+    if (!b) return;
+    if (b.hasAttribute('data-more-rows')) { b.textContent = 'Drawing…'; setTimeout(function () { moreRows(b.getAttribute('data-more-rows')); }, 10); return; }
+    var box = b.closest('.table-box'), on = !box.classList.contains('cards');
+    // One choice for every table: remembered on this device.
+    ls('zas-view', on ? 'cards' : 'table');
+    $$('.table-box').forEach(function (x) {
+      x.classList.toggle('cards', on);
+      var t = x.querySelector('[data-view-toggle]');
+      if (t) { t.textContent = on ? 'Show as a table' : 'Show as cards'; t.setAttribute('aria-pressed', on ? 'true' : 'false'); }
+    });
+    edges(document);
+  });
+  // Paper always gets every row.
+  window.addEventListener('beforeprint', function () { Object.keys(laterRows).forEach(moreRows); });
   /** Mark tables that have more columns off to the right, and clear the mark at the end. */
   function edges(root) {
     $$('.table-box', root).forEach(function (b) {
@@ -976,7 +1286,7 @@ var Z = (function () {
   return {
     date: date, when: when, closeBtn: closeBtn, lc: function (l) { l = String(l || ''); return /^[A-Z][a-z]/.test(l) ? l.charAt(0).toLowerCase() + l.slice(1) : l; },
     state: state, esc: esc, num: num, money: money, pct: pct, $: $, $$: $$, href: href, go: go, call: call, toast: toast, ask: ask, route: route,
-    outbox: { mine: boxMine, change: boxChange, flush: flush, queue: queue, limit: LIMIT }, offlineProfile: offlineProfile, rememberMe: rememberMe, badge: badge,
+    outbox: { mine: boxMine, change: boxChange, flush: flush, queue: queue, limit: LIMIT }, offlineProfile: offlineProfile, rememberMe: rememberMe, badge: badge, local: Local, notify: notify,
     icon: icon, reportHtml: reportHtml, sectionHtml: sectionHtml, picker: picker, bindForm: bindForm, field: field, text: text, showFieldErrors: showFieldErrors,
     chart: chart, labelThemeButton: labelThemeButton, parseHash: parseHash, signedOut: signedOut, formData: formData, LABEL: LABEL
   };

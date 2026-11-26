@@ -19,21 +19,45 @@ var App = (function () {
     var paint = function (p) {
       var v = $('#guestVisual'), b = $('#guestBanner');
       if (!v) return;
-      if (p.data) { v.style.backgroundImage = 'url("' + p.data + '")'; var m = v.querySelector('.guest-visual-mark'); if (m) m.remove(); }
+      if (p.data && /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+\/=]+$/.test(p.data)) { v.style.backgroundImage = 'url("' + p.data + '")'; var m = v.querySelector('.guest-visual-mark'); if (m) m.remove(); }
+      if (p.banner === undefined || !b) return;   // the device's copy of the picture: the line comes with the server's answer
       b.textContent = p.banner || '';
       if (!p.banner) b.parentNode.remove();
     };
-    if (Z.state.picture) paint(Z.state.picture);
-    else Z.call('picture').then(function (p) { Z.state.picture = p; paint(p); }).catch(function () {});
+    if (Z.state.picture) { paint(Z.state.picture); return; }
+    // The picture can be large: the device keeps it, and asks the server only whether it changed.
+    var v = BOOT.picV || '';
+    Z.local.media('picture', v).then(function (kept) {
+      if (kept && v) paint({ data: kept });
+      return Z.call('picture', kept ? { v: v } : {}).then(function (p) {
+        if (p.same) p.data = kept;
+        else if (p.v) Z.local.media('picture', p.v, p.data || '');
+        Z.state.picture = p; paint(p);
+      });
+    }).catch(function () {});
   }
 
   /** Where to open with no network: the report form for this person's role. */
   function startForm(me) { return me.arm ? '#/fs/entry/new' : '#/entry/attendance/new'; }
 
+  /** The logo: the device's own copy while it is the current one, otherwise fetched once and kept. */
+  function logo(v) {
+    if (!v) return Promise.resolve(null);
+    return Z.local.media('logo', v).then(function (kept) {
+      if (kept) return kept;
+      return Z.call('logo').then(function (data) { if (data) Z.local.media('logo', v, data); return data; });
+    }).catch(function () { return Z.call('logo').catch(function () { return null; }); });
+  }
+
   function start() {
-    Promise.all([Z.call('boot'), Z.call('logo').catch(function () { return null; })]).then(function (res) {
+    if (window.ZAS_FRAMED) return;   // inside another site's frame: never start
+    if ('storage' in navigator && navigator.storage && navigator.storage.persist) { try { navigator.storage.persist().catch(function () {}); } catch (e) {} }
+    Promise.all([Z.call('boot'), Z.local.restore()]).then(function (res) {
       var b = res[0];
-      Z.state.logo = res[1];
+      BOOT.picV = b.picV || ''; BOOT.logoV = b.logoV || '';
+      return (b.logoV === undefined ? Z.call('logo').catch(function () { return null; }) : logo(b.logoV)).then(function (l) { Z.state.logo = l; return [b]; });
+    }).then(function (res) {
+      var b = res[0];
       BOOT.appName = b.appName; BOOT.church = b.church; BOOT.zone = b.zone; BOOT.hasUsers = b.hasUsers; BOOT.setupPending = b.setupPending; BOOT.web = b.web || '';
       document.title = b.appName;
       if (BOOT.reset === 'invalid') { BOOT.reset = ''; return badLink(); }
@@ -43,7 +67,8 @@ var App = (function () {
       if (!Z.state.token) return login();
       return Z.call('me').then(function (me) {
         Z.state.me = me;
-        if (Z.state.offline && (!location.hash || location.hash === '#' || location.hash === '#/')) location.hash = startForm(me);
+        Z.state.vaultOK = Z.local.ready();
+        if (Z.state.offline && !Z.local.ready() && (!location.hash || location.hash === '#' || location.hash === '#/')) location.hash = startForm(me);
         Z.route();
       }).catch(function () { login(); });
     }).catch(function (e) {
@@ -68,27 +93,41 @@ var App = (function () {
     var ts = $('#toSetup'); if (ts) ts.addEventListener('click', function (e) { e.preventDefault(); setupView(); });
     var f = $('#login');
     var prof = Z.offlineProfile();
+    if (prof && $('#f_username') && !$('#f_username').value) $('#f_username').value = prof.username || '';
     var offerOffline = function () {
-      if (!prof || prof.role === 'system' || $('#offlineGo')) return;
+      if (!prof || prof.role === 'system' || $('#offlineNote')) return;
       var p = document.createElement('div');
-      p.className = 'notice warn'; p.setAttribute('role', 'status'); p.style.marginTop = '1rem';
-      p.innerHTML = '<b>No network?</b> You can still enter reports on this device as <b>' + esc(prof.full_name) + '</b>. They are sent when the network returns and you sign in.'
-        + '<div style="margin-top:.6rem"><button type="button" class="btn" id="offlineGo">Enter reports without network</button></div>';
+      p.className = 'notice warn'; p.setAttribute('role', 'status'); p.style.marginTop = '1rem'; p.id = 'offlineNote';
+      p.innerHTML = '<b>No network?</b> Sign in as usual: this device can check the password of <b>' + esc(prof.full_name) + '</b> itself and open the system without network. '
+        + 'Reports you enter wait on the device and are sent when the network returns; pages you have opened before can be read again.';
       f.parentNode.insertBefore(p, f.nextSibling);
-      $('#offlineGo').addEventListener('click', function () {
-        Z.state.me = prof; Z.state.token = null; Z.state.offlineOnly = true;
-        location.hash = startForm(prof); Z.route();
+    };
+    /** With no network, check the password against the copy kept on this device and work offline. */
+    var tryOffline = function () {
+      var d = Z.formData(f);
+      if (!prof || !d.username || !d.password || String(d.username).trim().toLowerCase() !== String(prof.username || '').toLowerCase()) { offerOffline(); return; }
+      Z.local.unlockOffline(d.username, d.password).then(function (uid) {
+        if (uid !== prof.id) throw { none: true };
+        Z.state.me = prof; Z.state.token = null; Z.state.offlineOnly = true; Z.state.vaultOK = true;
+        Z.toast('No network: working on this device.');
+        location.hash = '#/'; Z.route();
+      }).catch(function (e) {
+        if (e && e.wrong) Z.showFieldErrors(f, { message: 'There is no network, and the password is not the one last used on this device.', fields: { password: 'Check the password and try again.' } });
+        else offerOffline();
       });
     };
     if (navigator.onLine === false || Z.state.offline) offerOffline();
-    f.addEventListener('zas-offline', offerOffline);
-    $('#f_username').focus();
-    Z.bindForm(f, 'login', null, function (d) {
+    f.addEventListener('zas-offline', tryOffline);
+    ($('#f_username').value ? $('#f_password') : $('#f_username')).focus();
+    Z.bindForm(f, 'login', null, function (d, payload) {
       Z.state.token = d.token; Z.state.me = d.me; Z.state.offlineOnly = false;
       Z.rememberMe(d.me);
-      if (Z.outbox.mine().some(function (x) { return x.review; })) { try { sessionStorage.setItem('zas-token', d.token); } catch (e) {} location.hash = '#/outbox'; Z.route(); return; }
       try { sessionStorage.setItem('zas-token', d.token); } catch (e) {}
-      if (!location.hash || location.hash === '#') location.hash = '#/'; else Z.route();
+      // A key for the copies kept on this device, from the password just typed (never stored).
+      Z.local.unlock(d.me, payload.password).then(function (ok) { Z.state.vaultOK = !!ok; }).then(function () {
+        if (Z.outbox.mine().some(function (x) { return x.review; })) { location.hash = '#/outbox'; Z.route(); return; }
+        if (!location.hash || location.hash === '#') location.hash = '#/'; else Z.route();
+      });
     });
   }
 
@@ -229,6 +268,14 @@ var App = (function () {
       if (!d.detail) delete d.detail;
       Z.go(path, d);
     });
+  }
+
+  /** Previous / next for a list the server sends a page at a time. */
+  function pager(path, q, d) {
+    if (!d || !(d.pages > 1)) return '';
+    return '<nav class="btn-row pager" aria-label="Pages" style="margin-top:.75rem">' + (d.page > 1 ? '<a class="btn small" href="' + esc(href(path, Object.assign({}, q, { page: d.page - 1 }))) + '">Previous</a>' : '')
+      + '<span class="small muted" style="align-self:center">Page ' + d.page + ' of ' + d.pages + ' (' + num(d.total) + ')</span>'
+      + (d.page < d.pages ? '<a class="btn small" href="' + esc(href(path, Object.assign({}, q, { page: d.page + 1 }))) + '">Next</a>' : '') + '</nav>';
   }
 
   function figure(label, value, sub, link, cls) {
@@ -384,9 +431,9 @@ var App = (function () {
 
   function entryList(main, kind, r) {
     var q = r.q;
-    return Promise.all([Z.call('entry.setup'), Z.call('entry.list', { kind: kind, month: q.month || (kind === 'gck' ? '' : thisMonth()), status: q.status, type: q.type, period: q.period })]).then(function (res) {
+    return Promise.all([Z.call('entry.setup'), Z.call('entry.list', { kind: kind, month: q.month || (kind === 'gck' ? '' : thisMonth()), status: q.status, type: q.type, period: q.period, page: q.page })]).then(function (res) {
       var setup = res[0], d = res[1];
-      var h = '<div class="page-head"><div><h1>' + esc(KIND[kind].title) + '</h1><p class="small muted">' + num(d.total) + ' report' + (d.total === 1 ? '' : 's') + ' found' + (d.total > 200 ? ', newest 200 shown' : '') + '. Open a report to correct' + (Z.state.me.rank <= 3 ? ', void or delete' : '') + ' it.</p></div>'
+      var h = '<div class="page-head"><div><h1>' + esc(KIND[kind].title) + '</h1><p class="small muted">' + num(d.total) + ' report' + (d.total === 1 ? '' : 's') + ' found, newest first. Open a report to correct' + (Z.state.me.rank <= 3 ? ', void or delete' : '') + ' it.</p></div>'
         + (sysAdmin() ? '' : '<a class="btn primary" href="#/entry/' + kind + '/new">Enter ' + (kind === 'metrics' ? 'metrics' : 'a report') + '</a>') + '</div>';
       h += '<form class="filters" id="ef">';
       if (kind === 'gck') h += '<div><label for="e_period">Crusade period</label><select id="e_period" name="period"><option value="">All</option>' + setup.allCrusades.map(function (c) { return '<option value="' + c.id + '"' + (Number(q.period) === c.id ? ' selected' : '') + '>' + esc(c.name) + '</option>'; }).join('') + '</select></div>';
@@ -401,7 +448,7 @@ var App = (function () {
         return '<li><span class="grow"><b><a href="' + esc(href('/entry/' + kind + '/' + x.id, { p: x.p })) + '">' + esc(title) + '</a></b><span class="small muted">' + esc(when) + '</span></span>'
           + (x.type ? '<span class="badge type">' + esc(x.type) + '</span>' : '') + (x.status === 'voided' ? '<span class="badge off">Voided</span>' : '')
           + (kind !== 'metrics' ? '<b class="nowrap">' + num(x.total) + '</b>' : '') + '</li>';
-      }).join('') + '</ul></div>';
+      }).join('') + '</ul></div>' + pager('/entry/' + kind, q, d);
       main.innerHTML = h;
       $('#ef').addEventListener('submit', function (e) { e.preventDefault(); Z.go('/entry/' + kind, Z.formData($('#ef'))); });
     });
@@ -646,8 +693,7 @@ var App = (function () {
           + (u.status !== 'active' ? '<span class="badge off">Inactive</span>' : '')
           + (CHILD[level] ? '<a class="btn small" href="' + esc(href('/org/' + CHILD[level], { parent: u.id })) + '">' + num(u.children) + ' ' + esc(Z.lc(PLURAL[CHILD[level]])) + '</a>' : '') + '</li>';
       }).join('') + '</ul></div>';
-      if (d.pages > 1) h += '<div class="btn-row" style="margin-top:.75rem">' + (d.page > 1 ? '<a class="btn small" href="' + esc(href('/org/' + level, Object.assign({}, q, { page: d.page - 1 }))) + '">Previous</a>' : '')
-        + '<span class="small muted" style="align-self:center">Page ' + d.page + ' of ' + d.pages + ' (' + num(d.total) + ')</span>' + (d.page < d.pages ? '<a class="btn small" href="' + esc(href('/org/' + level, Object.assign({}, q, { page: d.page + 1 }))) + '">Next</a>' : '') + '</div>';
+      h += pager('/org/' + level, q, d);
       main.innerHTML = h;
       $('#of').addEventListener('submit', function (e) { e.preventDefault(); Z.go('/org/' + level, Z.formData($('#of'))); });
     });
@@ -755,7 +801,7 @@ var App = (function () {
     var q = r.q;
     // With no network the list cannot be read, so go straight to the form.
     if (Z.state.offline || Z.state.offlineOnly || navigator.onLine === false) return fsForm(main, arm, null, q);
-    return Z.call('fs.list', { month: q.month || thisMonth(), status: q.status, type: q.type }).catch(function (e) {
+    return Z.call('fs.list', { month: q.month || thisMonth(), status: q.status, type: q.type, page: q.page }).catch(function (e) {
       if (e && e.offline) return null;   // the network went just now
       throw e;
     }).then(function (d) {
@@ -768,7 +814,7 @@ var App = (function () {
       h += d.rows.length ? '<div class="card"><ul class="list">' + d.rows.map(function (x) {
         return '<li><span class="grow"><b><a href="' + esc(href('/fs/entry/' + x.id, { p: x.p })) + '">' + esc(x.institution) + '</a></b><span class="small muted">' + esc(Z.date(x.report_date)) + ', week ' + x.week + ', ' + esc(x.division) + '</span></span>'
           + '<span class="badge type">' + esc(x.type) + '</span>' + (x.status === 'voided' ? '<span class="badge off">Voided</span>' : '') + '<b class="nowrap">' + num(x.total) + '</b></li>';
-      }).join('') + '</ul></div>' : '<div class="card empty">No reports for this month. <a href="#/fs/entry/new">Enter one</a>.</div>';
+      }).join('') + '</ul></div>' + pager('/fs/entry', q, d) : '<div class="card empty">No reports for this month. <a href="#/fs/entry/new">Enter one</a>.</div>';
       main.innerHTML = h;
       $('#fe').addEventListener('submit', function (e) { e.preventDefault(); Z.go('/fs/entry', Z.formData($('#fe'))); });
     });
@@ -1151,7 +1197,10 @@ var App = (function () {
       + Z.field('password', 'New password', '<div class="pw"><input type="password" id="f_password" name="password" autocomplete="new-password"><button type="button" class="pw-toggle" data-pw-toggle aria-label="Show the password" aria-pressed="false">Show</button></div>', 'At least 10 characters, not containing your username.')
       + Z.field('confirm', 'Type the new password again', '<div class="pw"><input type="password" id="f_confirm" name="confirm" autocomplete="new-password"><button type="button" class="pw-toggle" data-pw-toggle aria-label="Show the password" aria-pressed="false">Show</button></div>')
       + '<button class="btn primary" type="submit">Change password</button></form>';
-    Z.bindForm($('#pf'), 'password', null, function () { Z.toast('Your password has been changed.'); $('#pf').reset(); });
+    Z.bindForm($('#pf'), 'password', null, function (d, payload) {
+      Z.local.unlock(Z.state.me, payload.password).then(function (ok) { Z.state.vaultOK = !!ok; });
+      Z.toast('Your password has been changed.'); $('#pf').reset();
+    });
   }
 
   function admin(main, r) {
@@ -1279,8 +1328,9 @@ var App = (function () {
       + '<div class="value" style="font-size:2rem;font-weight:600;margin:.4rem 0">' + Z.pct(o.percent) + '</div>' + bar(o.percent, o.threshold)
       + '<p class="small muted" style="margin-top:.5rem">' + num(o.grid) + ' cells in the sheets, of which ' + num(o.used) + ' hold data. The line marks the archive threshold (' + o.threshold + '%).</p>'
       + (spare ? '<div class="notice info small">' + num(spare) + ' cells are empty rows and columns that trimming would free.</div>' : '')
-      + '<div class="btn-row"><button type="button" class="btn primary" id="mTrim">Trim empty rows and columns</button><button type="button" class="btn" id="mAuto">Run full maintenance now</button><button type="button" class="btn" id="mRebuild">Rebuild summaries</button></div>'
+      + '<div class="btn-row"><button type="button" class="btn primary" id="mTrim">Trim empty rows and columns</button><button type="button" class="btn" id="mAuto">Run full maintenance now</button><button type="button" class="btn" id="mFlush">Refresh cached copies</button><button type="button" class="btn" id="mRebuild">Rebuild summaries</button></div>'
       + '<p class="hint">Full maintenance trims, then archives the oldest years while the spreadsheet is above the threshold, always keeping the newest ' + o.keepYears + ' year' + (o.keepYears === 1 ? '' : 's') + '.</p>'
+      + '<p class="hint">Pages are served from copies that renew the moment anything is entered in the system. If figures were changed by hand in the spreadsheet, press Refresh cached copies (otherwise the change shows within an hour).</p>'
       + (o.last ? '<p class="small muted">Last full run: ' + esc(Z.when(o.last.at)) + (o.last.archived && o.last.archived.length ? ', archived ' + esc(o.last.archived.join(', ')) : ', nothing archived') + (o.last.note ? '. ' + esc(o.last.note) : '') + '</p>' : '')
       + '<div id="mMsg"></div></div>'
       + (o.oldCopies.length ? '<div class="card pad"><h2>Copies left from the upgrade</h2><p class="small muted">When the reports moved into month sheets, the old sheets were kept so they could be checked: '
@@ -1326,6 +1376,7 @@ var App = (function () {
     });
     $('#mTrim').addEventListener('click', function () { busy(this, 'Trimming…', 'maint.trim', {}, function (d) { Z.toast(d.freed ? num(d.freed) + ' empty cells removed.' : 'Nothing to trim.'); }); });
     if ($('#mOld')) $('#mOld').addEventListener('click', function () { var b = this; Z.ask({ title: 'Remove the old copied sheets?', message: 'Sheets left behind by an earlier version will be deleted from the data spreadsheet. Make a backup first.', ok: 'Remove sheets', tone: 'danger' }).then(function (yes) { if (yes) busy(b, 'Checking…', 'maint.removeOld', {}, function (d) { Z.toast('Removed ' + d.result.length + ' old sheet' + (d.result.length === 1 ? '' : 's') + '.'); }); }); });
+    $('#mFlush').addEventListener('click', function () { busy(this, 'Refreshing…', 'maint.flush', {}, function () { Z.toast('Cached copies dropped. Pages now read the spreadsheet afresh.'); }); });
     $('#mRebuild').addEventListener('click', function () { busy(this, 'Rebuilding…', 'maint.rebuild', {}, function (d) { Z.toast('Summaries rebuilt: ' + num(d.result.lines) + ' lines.'); }); });
     $('#mAuto').addEventListener('click', function () { var b = this; Z.ask({ title: 'Run full maintenance now?', message: 'Empty rows and columns will be trimmed. If the spreadsheet is more than ' + o.threshold + '% full, the oldest years will be moved to archive spreadsheets. Make a backup first.', ok: 'Run maintenance', tone: 'warn' }).then(function (yes) { if (yes) busy(b, 'Working…', 'maint.auto', {}, function (d) { Z.toast(d.result.archived.length ? 'Archived ' + d.result.archived.join(', ') + '.' : 'Trimmed. Below the threshold, so nothing was archived.'); }); }); });
     $$('[data-archive]').forEach(function (b) {
@@ -1347,7 +1398,7 @@ var App = (function () {
     settings_changed: 'Settings changed', meeting_type_added: 'Meeting type added', meeting_type_changed: 'Meeting type changed',
     crusade_added: 'Crusade period opened', crusade_changed: 'Crusade period changed', backup_made: 'Backup made',
     logo_changed: 'Logo changed', logo_removed: 'Logo removed', login_picture_changed: 'Sign-in picture changed', login_picture_removed: 'Sign-in picture removed', login_banner_changed: 'Scrolling line changed',
-    maintenance_run: 'Full maintenance run', maintenance_settings: 'Archiving settings changed', sheets_trimmed: 'Sheets trimmed', summaries_rebuilt: 'Summaries rebuilt',
+    maintenance_run: 'Full maintenance run', cache_cleared: 'Cached copies refreshed', maintenance_settings: 'Archiving settings changed', sheets_trimmed: 'Sheets trimmed', summaries_rebuilt: 'Summaries rebuilt',
     old_copies_removed: 'Old copied sheets removed', year_archived: 'Year archived', year_archive_finished: 'Unfinished archive completed',
     system_set_up: 'System set up', zone_leader_changed: 'Zonal Coordinating Overseer changed', fellowship_added: 'Fellowship added', fellowship_changed: 'Fellowship changed', fellowship_report_created: 'Fellowship report entered',
     fellowship_report_corrected: 'Fellowship report corrected', fellowship_report_voided: 'Fellowship report voided', fellowship_report_deleted: 'Fellowship report deleted', report_deleted: 'Report deleted', group_created: 'Group added', group_changed: 'Group changed', group_deactivated: 'Group switched off', group_reactivated: 'Group switched back on', sectional_heads_changed: 'Sectional heads changed', sections_changed: 'List of sections changed', spreadsheet_access_locked: 'Spreadsheet made private', setup_code_failed: 'Wrong set-up code'
@@ -1387,7 +1438,7 @@ var App = (function () {
       if (Z.state.me && Z.state.me.arm) {
         // DLSO and DLCF coordinators: their own pages only.
         if (!p.length) return fsHome;
-        var mine = { fs: fsEntry, account: account, reports: report };
+        var mine = { fs: fsEntry, account: account, reports: report, outbox: outbox };
         mine[Z.state.me.arm === 'dlso' ? 'schools' : 'campuses'] = institutions;
         if (p[0] === 'reports' && p[1] !== Z.state.me.arm) return function () { throw { code: 'FORBIDDEN', message: 'This page is not part of ' + Z.state.me.armLabel.code + '.' }; };
         return mine[p[0]] || function (main) { main.innerHTML = '<h1>Page not found</h1><div class="card empty">That page does not exist. <a href="#/">Go to the home page</a>.</div>'; };

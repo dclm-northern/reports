@@ -1,5 +1,13 @@
 // Start-up for the GitHub Pages version: what doGet() gives the Apps Script version.
 (function () {
+  // The system never runs inside another site's frame (a page could otherwise lay invisible
+  // buttons over it). GitHub Pages cannot send the header that forbids framing, so check here.
+  if (window.top !== window.self) {
+    try { window.top.location = window.self.location.href; } catch (e) {}
+    document.documentElement.style.display = 'none';
+    window.ZAS_FRAMED = true;
+    return;
+  }
   var t = null;
   try { t = localStorage.getItem('zas-theme'); } catch (e) {}
   if (t !== 'light' && t !== 'dark') t = window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
@@ -48,8 +56,20 @@
     }, 30000);
   });
 
-  // Keep a copy of the screens on this device, so the system opens at once next time.
-  if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
-    window.addEventListener('load', function () { navigator.serviceWorker.register('sw.js').catch(function () {}); });
+  // Keep a copy of the screens on this device, so the system opens at once next time, and with
+  // no network at all. When a new version arrives, say so and offer to switch to it.
+  if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
+    var hadController = !!navigator.serviceWorker.controller, reloading = false;
+    navigator.serviceWorker.addEventListener('controllerchange', function () {
+      if (!hadController || reloading) { hadController = true; return; }
+      var go = function () { reloading = true; location.reload(); };
+      if (window.Z && Z.notify) Z.notify('A new version of the system is ready.', 'Use it now', go);
+    });
+    window.addEventListener('load', function () {
+      navigator.serviceWorker.register('sw.js').then(function (reg) {
+        // Look for a new version whenever the system comes back to the front.
+        document.addEventListener('visibilitychange', function () { if (!document.hidden) reg.update().catch(function () {}); });
+      }).catch(function () {});
+    });
   }
 })();
