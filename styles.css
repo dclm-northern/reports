@@ -250,6 +250,19 @@ table.data .group-row td { background: var(--surface-2); }
 table.data .edge { border-left: 2px solid var(--line-2); }
 table.data abbr { text-decoration: none; }
 tr.row-missing > * { color: var(--faint); font-style: italic; }
+/* DLSO and DLCF rows in the church reports: shaded, with a coloured edge, so they stand apart from the districts. */
+:root { --dlso: #8a5a00; --dlso-soft: #fff6e0; --dlcf: #0f6b5c; --dlcf-soft: #e3f5f1; }
+:root[data-theme="dark"] { --dlso: #f2c063; --dlso-soft: #2b2312; --dlcf: #6fd3bf; --dlcf-soft: #12291f; }
+table.data tr.row-dlso > * { background: var(--dlso-soft); }
+table.data tr.row-dlcf > * { background: var(--dlcf-soft); }
+table.data tr.row-dlso > th:first-child { box-shadow: inset 4px 0 0 var(--dlso); }
+table.data tr.row-dlcf > th:first-child { box-shadow: inset 4px 0 0 var(--dlcf); }
+table.data tr.row-dlso > th a { color: var(--dlso); }
+table.data tr.row-dlcf > th a { color: var(--dlcf); }
+table.data tr.row-fs.row-missing > * { font-style: normal; }
+.table-box.cards table.data tr.row-dlso { border-left: 4px solid var(--dlso); }
+.table-box.cards table.data tr.row-dlcf { border-left: 4px solid var(--dlcf); }
+@media print { table.data tr.row-dlso > *, table.data tr.row-dlcf > * { background: #f3f3f3 !important; } }
 tr.row-pending > th { box-shadow: inset 3px 0 0 var(--gold); }
 table.data tr.row-sub > * { background: var(--surface-2); font-weight: 600; }
 .delta-up { color: var(--good); } .delta-down { color: var(--bad); }

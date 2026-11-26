@@ -884,7 +884,12 @@ var Z = (function () {
     // Each cell carries its column's name (with its group's), for the card view on phones.
     var groupOf = [];
     if (t.groups) { var at = 0; t.groups.forEach(function (g) { for (var j = 0; j < g.span; j++) groupOf[at + j] = g.label || ''; at += g.span; }); }
-    var labels = t.columns.map(function (c, i) { return ((groupOf[i] && i >= lead ? groupOf[i] + ' ' : '') + (c.full || c.label)).trim(); });
+    var labels = t.columns.map(function (c, i) {
+      var name = c.full || c.label, g = groupOf[i] && i >= lead ? groupOf[i] : '';
+      // "Adults" over "Adult male" says nothing new; "DLSO" over "Male" does.
+      if (g && name.toLowerCase().indexOf(g.toLowerCase().substring(0, 5)) >= 0) g = '';
+      return ((g ? g + ' ' : '') + name).trim();
+    });
     var shown = t.columns.filter(function (c) { return c.type !== 'edit'; }).length;
     var pref = viewPref(), cards = pref === 'cards' || (pref === 'auto' && (shown <= CARD_COLS || t.rows.length <= 5));
     var rowHtml = function (row) {

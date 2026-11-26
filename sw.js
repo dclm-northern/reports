@@ -1,9 +1,9 @@
 // Keeps the screens on the device, so the system opens at once and works with no network.
-// Version 36a1663d70 (the build sets it; a new version replaces the old copies).
-var VERSION = '36a1663d70';
+// Version 317311eddd (the build sets it; a new version replaces the old copies).
+var VERSION = '317311eddd';
 var SHELL_CACHE = 'zas-shell-' + VERSION;
 var LIBS_CACHE = 'zas-libs-1';   // Chart.js and the fonts: fixed versions, kept across updates
-var SHELL = ["./","index.html","config.js","manifest.webmanifest","app.js?v=4e6deb771c","views.js?v=eba6c6d27e","picture.js?v=4a3197a23a","styles.css?v=8cc343b714","boot.js?v=007e0baac1","icon-192.png","icon-512.png","icon-maskable-512.png","apple-touch-icon.png","favicon.png"];
+var SHELL = ["./","index.html","config.js","manifest.webmanifest","app.js?v=aab11cb6d7","views.js?v=bad5b66afb","picture.js?v=4a3197a23a","styles.css?v=6064a5c1ee","boot.js?v=007e0baac1","icon-192.png","icon-512.png","icon-maskable-512.png","apple-touch-icon.png","favicon.png"];
 // Files from other sites that the page uses and that may be kept: the chart library (a fixed
 // version, checked by the page with its integrity hash) and the fonts.
 var LIBS = /^https:\/\/(cdn\.jsdelivr\.net\/npm\/chart\.js@4\.4\.1\/|fonts\.googleapis\.com\/css2|fonts\.gstatic\.com\/)/;

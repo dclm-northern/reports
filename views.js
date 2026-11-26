@@ -375,7 +375,11 @@ var App = (function () {
       if (['pastors', 'locations', 'heads', 'dlso', 'dlcf', 'overview'].indexOf(name) < 0) h += '<nav class="tabs no-print" aria-label="Reports">' + TABS.map(function (tb) {
         return '<a href="' + esc(href('/reports/' + tb[0], keep)) + '"' + (tb[0] === name ? ' class="on" aria-current="page"' : '') + '>' + tb[1] + '</a>'; }).join('') + '</nav>';
       h += filters(path, q, def[1], t) + trail(t.node, path, Object.assign({}, q, { level: '', id: '' }));
-      var link = function (l) { return href(path, Object.assign({}, q, { level: l.level, id: l.id, by: '' })); };
+      var link = function (l) {
+        // A DLSO or DLCF row opens that arm's report for its division, same month and meeting.
+        if (l.report) return href('/reports/' + l.report, { level: l.level, id: l.id, month: q.month, type: name === 'hcf' ? 'HCF' : q.type });
+        return href(path, Object.assign({}, q, { level: l.level, id: l.id, by: '' }));
+      };
       if (name === 'analysis' && t.charts) {
         var c = t.charts.tiles;
         h += '<div class="grid g2 g4" style="margin-bottom:.5rem">' + figure('Total attendance', num(c.total), 'Average per meeting, ' + c.locations + ' locations', null, 'lead')
@@ -763,9 +767,8 @@ var App = (function () {
   }
 
   // ------------------------------------------------------------------ DLSO and DLCF
-  var FS_PEOPLE = [['students_male', 'Students male'], ['students_female', 'Students female']];
-  // DLCF only: families living on the campus (staff and their households) who attend.
-  var FS_FAMILY = [['adults_male', 'Adults male'], ['adults_female', 'Adults female'], ['youth_male', 'Youth boys'], ['youth_female', 'Youth girls'], ['children_male', 'Children boys'], ['children_female', 'Children girls']];
+  // The same six columns as a church attendance report, for DLSO and DLCF alike.
+  var FS_FAMILY = [['adults_male', 'Adult male'], ['adults_female', 'Adult female'], ['youth_male', 'Youth boys'], ['youth_female', 'Youth girls'], ['children_male', 'Children boys'], ['children_female', 'Children girls']];
   var FS_MORE = [['newcomers_male', 'Newcomers male'], ['newcomers_female', 'Newcomers female'], ['converts_male', 'Converts male'], ['converts_female', 'Converts female']];
   function armOf(r) { return Z.state.me.arm || (r.parts[0] === 'campuses' || r.q.arm === 'dlcf' ? 'dlcf' : 'dlso'); }
   function placesPath(arm) { return arm === 'dlso' ? '/schools' : '/campuses'; }
@@ -840,9 +843,9 @@ var App = (function () {
         return '<option value="' + t.id + '"' + ((editing ? x.type_id === t.id : q.type === t.code) ? ' selected' : '') + '>' + esc(t.code + ', ' + t.name) + '</option>'; }).join('') + '</select>');
       h += Z.field('report_date', 'Date of the meeting', '<input type="date" id="f_report_date" name="report_date" value="' + esc(editing ? x.report_date : s.today) + '" max="' + esc(s.today) + '"' + (s.backdate && !editing ? ' min="' + esc(addDays(s.today, -s.backdate)) + '"' : '') + '>', '<span id="weekHint"></span>');
       var summed = function (list) { return numInputs(list, x).replace(/ data-sum/g, '').replace(/ name="/g, ' data-sum name="'); };
-      var family = s.arm === 'dlcf';
-      h += '</div></fieldset><fieldset data-sum-group><legend>Attendance</legend>' + (family ? '<h3 class="fs-sub">Students</h3>' : '') + summed(FS_PEOPLE)
-        + (family ? '<h3 class="fs-sub">Families living on the campus</h3><p class="small muted">Staff and their households who attend the fellowship. Leave empty when none came.</p>' + summed(FS_FAMILY) : '')
+      h += '</div></fieldset><fieldset data-sum-group><legend>Attendance</legend><p class="small muted">The same columns as a church report. '
+        + (s.arm === 'dlso' ? 'Students in the school are youth; teachers and other adults who attend are adults.' : 'Students on the campus are adults; families living on the campus count in their own columns.') + '</p>'
+        + summed(FS_FAMILY)
         + '<div class="total-line"><span>Total attendance</span><b data-sum-total>0</b></div></fieldset>'
         + '<fieldset><legend>Newcomers and converts</legend>' + numInputs(FS_MORE, x) + '</fieldset>'
         + '<fieldset><legend>Giving</legend><div class="num-grid">' + Z.field('offering', 'Tithes and offering (' + esc(s.currency) + ')',
@@ -872,7 +875,7 @@ var App = (function () {
   function fsShow(main, arm, id, p) {
     return Z.call('fs.get', { id: id, p: p }).then(function (x) {
       var rows = [['Fellowship', x.institution], ['Division', x.path], ['Meeting', x.type + ', ' + x.type_name], ['Date', Z.date(x.report_date) + ', week ' + x.week + ' of ' + monthLabel(x.year + '-' + (x.month < 10 ? '0' : '') + x.month)]];
-      FS_PEOPLE.concat(x.family ? FS_FAMILY : []).forEach(function (f) { rows.push([f[1], num(x[f[0]])]); });
+      FS_FAMILY.forEach(function (f) { rows.push([f[1], num(x[f[0]])]); });
       rows.push(['Total attendance', num(x.total)]);
       FS_MORE.forEach(function (f) { rows.push([f[1], num(x[f[0]])]); });
       rows.push(['Tithes and offering', Z.state.me.settings.currency + ' ' + Z.money(x.offering)]);
